@@ -40,6 +40,8 @@ def _build_parser() -> argparse.ArgumentParser:
                         "(default: <video>_results.json next to the video)")
     p.add_argument("--sample-rate", type=int, default=1,
                    help="(CLI) Process every Nth frame")
+    p.add_argument("--batch-size", type=int, default=32,
+                   help="(CLI) Frames per YOLO GPU call (default 32; reduce to 8 on CPU)")
     p.add_argument("--yolo-only", action="store_true",
                    help="(CLI) Skip MMAction2 even if available")
     p.add_argument("--all-classes", action="store_true",
@@ -111,6 +113,7 @@ def run_cli(args) -> None:
         conf_threshold=CAPTURE_CONF_FLOOR,   # always capture at floor
         frame_stride=args.sample_rate,
         allowed_classes=allowed_classes,
+        batch_size=args.batch_size,
     )
     raw_frames = detector.run(str(video_path), progress_cb=yolo_progress)
     print(f"\n  → {len(raw_frames)} frames captured at floor {CAPTURE_CONF_FLOOR}")

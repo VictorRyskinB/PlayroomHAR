@@ -1,27 +1,167 @@
 # ui/video_player.py
-# VideoPlayerWidget: OpenCV frame reading, playback, seek bar, bbox overlay.
+# VideoPlayerWidget: OpenCV frame reading, playback, seek bar, bbox overlay,
+# and interactive region-capture (rubber-band drawing of named ROIs).
 #
-# Two overlay modes (whichever was set most recently takes priority):
+# Overlay modes (most-recently-set wins):
 #   • Time-range mode  — set_bounding_boxes()    — mock data
 #   • Frame-index mode — set_frame_detections()  — real YOLO output
 #
-# Flicker fix: when using frame-index mode with a sample stride > 1, frames
-# between sample points show the most-recently-seen detections rather than
-# going blank.  This uses a sorted list of sampled frame indices + bisect.
+# Region editing:
+#   Call set_region_edit_mode(True) to enter drawing mode.
+#   The user rubber-bands a rectangle on the video frame.
+#   On mouse release the widget emits region_drawn(nx, ny, nw, nh)
+#   with normalised coordinates (0–1), accounting for KeepAspectRatio
+#   letterboxing.  The caller (MainWindow) prompts for a name and calls
+#   set_regions() to display the overlay.
+#
+# Flicker fix: between sampled frames, boxes show the nearest preceding
+# sample rather than going blank (sorted index + bisect).
 
 import bisect
 import cv2
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import Qt, QTimer, QRect, pyqtSignal
 from PyQt6.QtGui import QImage, QPixmap, QPainter, QPen, QColor, QFont
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel,
-    QPushButton, QSlider, QSizePolicy, QFileDialog,
+    QPushButton, QSlider, QSizePolicy, QFileDialog, QRubberBand,
 )
 
+# ---------------------------------------------------------------------------
+# Region colour palette (cycles if there are more than 8 regions)
+# ---------------------------------------------------------------------------
+
+_REGION_COLORS = [
+    (255, 100, 100),   # red
+    (100, 220, 100),   # green
+    (100, 140, 255),   # blue
+    (255, 220,  50),   # yellow
+    (255, 100, 220),   # pink
+    ( 80, 220, 220),   # cyan
+    (255, 160,  40),   # orange
+    (180, 100, 255),   # purple
+]
+
+
+# ---------------------------------------------------------------------------
+# _FrameLabel — QLabel subclass with rubber-band region drawing
+# ---------------------------------------------------------------------------
+
+class _FrameLabel(QLabel):
+    """
+    QLabel that captures mouse events to let the user draw named regions.
+    Emits region_drawn(nx, ny, nw, nh) in normalised video coordinates
+    (0–1) when the mouse is released after a drag of at least 5 px.
+
+    Call set_video_size(w, h) after loading a video so that the coordinate
+    mapping accounts for the KeepAspectRatio letterbox offset correctly.
+    """
+    region_drawn = pyqtSignal(float, float, float, float)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._edit_mode   = False
+        self._press_px: tuple | None = None   # (x, y) in label pixel coords
+        self._video_w     = 0
+        self._video_h     = 0
+        self._rubber_band = QRubberBand(QRubberBand.Shape.Rectangle, self)
+
+    # ---------------------------------------------------------------- public
+
+    def set_edit_mode(self, enabled: bool):
+        self._edit_mode = enabled
+        if not enabled:
+            self._rubber_band.hide()
+            self._press_px = None
+        self.setCursor(
+            Qt.CursorShape.CrossCursor
+            if enabled else Qt.CursorShape.ArrowCursor
+        )
+
+    def set_video_size(self, w: int, h: int):
+        self._video_w = w
+        self._video_h = h
+
+    # ---------------------------------------------------------------- mouse events
+
+    def mousePressEvent(self, event):
+        if self._edit_mode and event.button() == Qt.MouseButton.LeftButton:
+            self._press_px = (event.position().x(), event.position().y())
+            self._rubber_band.setGeometry(
+                QRect(int(self._press_px[0]), int(self._press_px[1]), 0, 0)
+            )
+            self._rubber_band.show()
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._edit_mode and self._press_px is not None:
+            x0, y0 = int(self._press_px[0]), int(self._press_px[1])
+            x1 = int(event.position().x())
+            y1 = int(event.position().y())
+            rect = QRect(
+                min(x0, x1), min(y0, y1),
+                abs(x1 - x0), abs(y1 - y0)
+            )
+            self._rubber_band.setGeometry(rect)
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if (self._edit_mode and self._press_px is not None
+                and event.button() == Qt.MouseButton.LeftButton):
+            self._rubber_band.hide()
+            x0, y0 = self._press_px
+            x1 = event.position().x()
+            y1 = event.position().y()
+            self._press_px = None
+
+            # Ignore tiny accidental clicks (< 5 px in either dimension)
+            if abs(x1 - x0) < 5 or abs(y1 - y0) < 5:
+                super().mouseReleaseEvent(event)
+                return
+
+            ox, oy, sw, sh = self._video_rect()
+            if sw == 0 or sh == 0:
+                super().mouseReleaseEvent(event)
+                return
+
+            # Clamp to video area, convert to normalised coords
+            nx = max(0.0, min(1.0, (min(x0, x1) - ox) / sw))
+            ny = max(0.0, min(1.0, (min(y0, y1) - oy) / sh))
+            nw = max(0.0, min(1.0 - nx, abs(x1 - x0) / sw))
+            nh = max(0.0, min(1.0 - ny, abs(y1 - y0) / sh))
+
+            if nw > 0.01 and nh > 0.01:
+                self.region_drawn.emit(nx, ny, nw, nh)
+
+        super().mouseReleaseEvent(event)
+
+    # ---------------------------------------------------------------- helpers
+
+    def _video_rect(self) -> tuple[int, int, int, int]:
+        """
+        Return (ox, oy, scaled_w, scaled_h) of the video image within
+        this label, accounting for KeepAspectRatio letterboxing.
+        """
+        lw, lh = self.width(),  self.height()
+        vw, vh = self._video_w, self._video_h
+        if vw == 0 or vh == 0 or lw == 0 or lh == 0:
+            return 0, 0, lw, lh
+        scale = min(lw / vw, lh / vh)
+        sw    = int(vw * scale)
+        sh    = int(vh * scale)
+        ox    = (lw - sw) // 2
+        oy    = (lh - sh) // 2
+        return ox, oy, sw, sh
+
+
+# ---------------------------------------------------------------------------
+# VideoPlayerWidget
+# ---------------------------------------------------------------------------
 
 class VideoPlayerWidget(QWidget):
     position_changed = pyqtSignal(int)   # current position in ms
     video_loaded     = pyqtSignal(str)   # path of newly loaded video
+    # Forwarded from _frame_label; caller should prompt for region name
+    region_drawn     = pyqtSignal(float, float, float, float)   # nx, ny, nw, nh
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -38,8 +178,24 @@ class VideoPlayerWidget(QWidget):
         # Frame-indexed overlay (real YOLO / loaded JSON)
         # Format: {frame_index: [(label, color_rgb, nx, ny, nw, nh), ...]}
         self._frame_detections: dict[int, list] = {}
-        self._sorted_sample_frames: list[int] = []   # sorted keys of _frame_detections
+        self._sorted_sample_frames: list[int] = []
         self._use_frame_detections = False
+
+        # MMAction2 temporal clips for action-label banner overlay
+        # Each entry: {"start_ms": float, "end_ms": float,
+        #               "action_label": str, "confidence": float}
+        self._action_clips: list[dict] = []
+
+        # Named spatial regions (normalised coords)
+        # Each entry: {"name": str, "nx": float, "ny": float,
+        #              "nw": float, "nh": float}
+        self._regions: list[dict] = []
+        self._region_edit_mode: bool = False
+
+        # Visibility toggles
+        self._show_yolo:      bool = True
+        self._show_mmaction2: bool = True
+        self._show_regions:   bool = True
 
         self._build_ui()
         self._timer = QTimer(self)
@@ -52,13 +208,15 @@ class VideoPlayerWidget(QWidget):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(4)
 
-        self._frame_label = QLabel("No video loaded")
+        self._frame_label = _FrameLabel("No video loaded")
         self._frame_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._frame_label.setStyleSheet("background:#1a1a2e; color:#888;")
         self._frame_label.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
         )
         self._frame_label.setMinimumSize(480, 320)
+        # Forward rubber-band draws upward to MainWindow
+        self._frame_label.region_drawn.connect(self.region_drawn)
         root.addWidget(self._frame_label, stretch=1)
 
         self._seek = QSlider(Qt.Orientation.Horizontal)
@@ -146,11 +304,62 @@ class VideoPlayerWidget(QWidget):
         self._use_frame_detections = True
         self._render_frame(self._current_frame)
 
+    def set_action_clips(self, clips: list[dict]):
+        """
+        Set MMAction2 temporal action clips for banner overlay.
+        Each dict: {"start_ms", "end_ms", "action_label", "confidence"}
+        """
+        self._action_clips = clips
+        self._render_frame(self._current_frame)
+
+    def set_yolo_visible(self, visible: bool):
+        self._show_yolo = visible
+        self._render_frame(self._current_frame)
+
+    def set_mmaction2_visible(self, visible: bool):
+        self._show_mmaction2 = visible
+        self._render_frame(self._current_frame)
+
+    def set_regions_visible(self, visible: bool):
+        self._show_regions = visible
+        self._render_frame(self._current_frame)
+
     def clear_detections(self):
         self._frame_detections = {}
         self._sorted_sample_frames = []
         self._bounding_boxes = []
         self._use_frame_detections = False
+        self._action_clips = []
+        self._render_frame(self._current_frame)
+
+    # ------------------------------------------------------------------ region API
+
+    def set_region_edit_mode(self, enabled: bool):
+        """
+        Enter / leave rubber-band region drawing mode.
+        In edit mode the cursor changes to a crosshair and mouse drags
+        draw a region rectangle.  A region_drawn signal is emitted when
+        the mouse is released; the caller should then prompt for a name
+        and call set_regions().
+        """
+        self._region_edit_mode = enabled
+        self._frame_label.set_edit_mode(enabled)
+
+    def set_regions(self, regions: list[dict]):
+        """
+        Replace the displayed region list and refresh the frame.
+        Each dict must have keys: name, nx, ny, nw, nh (normalised 0–1).
+        """
+        self._regions = list(regions)
+        self._render_frame(self._current_frame)
+
+    def get_regions(self) -> list[dict]:
+        """Return a copy of the current region list."""
+        return list(self._regions)
+
+    def clear_regions(self):
+        """Remove all regions and refresh."""
+        self._regions = []
         self._render_frame(self._current_frame)
 
     # ------------------------------------------------------------------ playback
@@ -197,12 +406,39 @@ class VideoPlayerWidget(QWidget):
 
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         h, w, ch = rgb.shape
-        qimg  = QImage(rgb.data, w, h, ch * w, QImage.Format.Format_RGB888)
+
+        # Keep _FrameLabel up to date so rubber-band coords are correct
+        self._frame_label.set_video_size(w, h)
+
+        qimg   = QImage(rgb.data, w, h, ch * w, QImage.Format.Format_RGB888)
         pixmap = QPixmap.fromImage(qimg)
 
-        active = self._get_active_boxes(frame_index, w, h)
-        if active:
-            painter = QPainter(pixmap)
+        painter = QPainter(pixmap)
+
+        # ── Named region overlays ──
+        if self._show_regions and self._regions:
+            for idx, region in enumerate(self._regions):
+                color = _REGION_COLORS[idx % len(_REGION_COLORS)]
+                rx = int(region["nx"] * w)
+                ry = int(region["ny"] * h)
+                rw = int(region["nw"] * w)
+                rh = int(region["nh"] * h)
+                # Dashed border
+                pen = QPen(QColor(*color), 2, Qt.PenStyle.DashLine)
+                painter.setPen(pen)
+                painter.drawRect(rx, ry, rw, rh)
+                # Name tag
+                name     = region["name"]
+                tag_w    = len(name) * 7 + 8
+                tag_h    = 17
+                painter.fillRect(rx, ry, tag_w, tag_h, QColor(*color, 200))
+                painter.setPen(QPen(Qt.GlobalColor.white))
+                painter.setFont(QFont("Arial", 9, QFont.Weight.Bold))
+                painter.drawText(rx + 4, ry + tag_h - 4, name)
+
+        # ── YOLO bounding boxes ──
+        if self._show_yolo:
+            active = self._get_active_boxes(frame_index, w, h)
             font = QFont("Arial", max(8, w // 60))
             painter.setFont(font)
             for label, color, x, y, bw, bh in active:
@@ -213,7 +449,22 @@ class VideoPlayerWidget(QWidget):
                                  QColor(*color, 180))
                 painter.setPen(QPen(Qt.GlobalColor.white))
                 painter.drawText(x + 3, y - 4, label)
-            painter.end()
+
+        # ── MMAction2 action-label banner ──
+        if self._show_mmaction2:
+            action = self._get_active_action(frame_index)
+            if action:
+                banner_h = max(22, h // 20)
+                painter.fillRect(0, h - banner_h, w, banner_h,
+                                 QColor(0, 0, 0, 180))
+                painter.setPen(QPen(QColor(120, 210, 255)))
+                font_sz = max(8, h // 36)
+                painter.setFont(QFont("Arial", font_sz, QFont.Weight.Bold))
+                text = (f"▶ {action['action_label']}"
+                        f"  ({action['confidence']:.2f})")
+                painter.drawText(6, h - banner_h + font_sz + 2, text)
+
+        painter.end()
 
         scaled = pixmap.scaled(
             self._frame_label.size(),
@@ -254,6 +505,18 @@ class VideoPlayerWidget(QWidget):
                 )
         return result
 
+    def _get_active_action(self, frame_index: int) -> dict | None:
+        """Return the highest-confidence action clip covering this frame, or None."""
+        if not self._action_clips:
+            return None
+        current_ms = frame_index / self._fps * 1000.0
+        best: dict | None = None
+        for clip in self._action_clips:
+            if clip["start_ms"] <= current_ms < clip["end_ms"]:
+                if best is None or clip["confidence"] > best["confidence"]:
+                    best = clip
+        return best
+
     def _lookup_nearest_sample(self, frame_index: int) -> list:
         """
         Return the detection list for frame_index if it was sampled, otherwise
@@ -262,11 +525,9 @@ class VideoPlayerWidget(QWidget):
         """
         if not self._sorted_sample_frames:
             return []
-        # Exact hit
         boxes = self._frame_detections.get(frame_index)
         if boxes is not None:
             return boxes
-        # Nearest preceding sample
         pos = bisect.bisect_right(self._sorted_sample_frames, frame_index) - 1
         if pos >= 0:
             return self._frame_detections.get(self._sorted_sample_frames[pos], [])

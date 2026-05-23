@@ -31,7 +31,7 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
-SCHEMA_VERSION    = "1.1"
+SCHEMA_VERSION    = "1.2"
 CAPTURE_CONF_FLOOR = 0.05   # YOLO floor used when producing new JSONs
 
 
@@ -44,12 +44,13 @@ def save_results(
     video_path: str | Path,
     settings: dict,
     modules_used: dict,
-    segments: list,     # list[Segment] from segment_builder
-    raw_frames: list,   # list[FrameDetections] from yolo_detector — at capture floor
+    segments: list,       # list[Segment] from segment_builder
+    raw_frames: list,     # list[FrameDetections] from yolo_detector — at capture floor
     fps: float,
     frame_w: int,
     frame_h: int,
     total_frames: int,
+    action_clips: list | None = None,  # list[ActionClip] — ALL clips, unfiltered
 ) -> None:
     """
     Serialize analysis results to a JSON file.
@@ -78,6 +79,7 @@ def save_results(
             "capture_conf_floor": settings.get("capture_conf_floor", CAPTURE_CONF_FLOOR),
             "frames": _serialize_raw_frames(raw_frames),
         },
+        "action_recognition": _serialize_action_clips(action_clips or []),
     }
 
     output_path = Path(output_path)
@@ -100,6 +102,26 @@ def _serialize_segments(segments: list) -> list:
             "action_source":     s.action_source,
         })
     return out
+
+
+def _serialize_action_clips(clips: list) -> dict:
+    """
+    Serialize ALL action clips (unfiltered) so the UI can apply the threshold live.
+    """
+    return {
+        "capture_conf_floor": 0.0,   # all clips stored regardless of confidence
+        "clips": [
+            {
+                "start_ms":    round(c.start_ms, 1),
+                "end_ms":      round(c.end_ms, 1),
+                "action_label": c.action_label,
+                "raw_label":   c.raw_label,
+                "confidence":  round(c.confidence, 4),
+                "model_name":  c.model_name,
+            }
+            for c in clips
+        ],
+    }
 
 
 def _serialize_raw_frames(raw_frames: list) -> dict:
@@ -183,6 +205,28 @@ def raw_frames_to_frame_detections(frames_json: dict, fps: float) -> list:
 
     result.sort(key=lambda fd: fd.frame_index)
     return result
+
+
+def action_clips_from_json(action_rec_json: dict) -> list:
+    """
+    Reconstruct list[ActionClip] from the JSON "action_recognition" section.
+    Returns [] if the section is absent (v1.0/v1.1 JSONs or YOLO-only runs).
+    """
+    from backend.action_recognizer import ActionClip
+    clips = []
+    for c in action_rec_json.get("clips", []):
+        try:
+            clips.append(ActionClip(
+                start_ms=float(c["start_ms"]),
+                end_ms=float(c["end_ms"]),
+                action_label=c["action_label"],
+                raw_label=c.get("raw_label", c["action_label"]),
+                confidence=float(c["confidence"]),
+                model_name=c.get("model_name", "unknown"),
+            ))
+        except (KeyError, TypeError):
+            continue
+    return clips
 
 
 # ---------------------------------------------------------------------------

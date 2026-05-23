@@ -1,11 +1,15 @@
 # ui/video_player.py
-# VideoPlayerWidget: handles video frame reading (OpenCV), playback timer,
-# seek bar, and bounding-box overlay rendering.
+# VideoPlayerWidget: OpenCV frame reading, playback, seek bar, bbox overlay.
 #
 # Two overlay modes (whichever was set most recently takes priority):
-#   • Time-range mode  — set_bounding_boxes()    — used by mock data
-#   • Frame-index mode — set_frame_detections()  — used by real YOLO output
+#   • Time-range mode  — set_bounding_boxes()    — mock data
+#   • Frame-index mode — set_frame_detections()  — real YOLO output
+#
+# Flicker fix: when using frame-index mode with a sample stride > 1, frames
+# between sample points show the most-recently-seen detections rather than
+# going blank.  This uses a sorted list of sampled frame indices + bisect.
 
+import bisect
 import cv2
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QImage, QPixmap, QPainter, QPen, QColor, QFont
@@ -16,10 +20,8 @@ from PyQt6.QtWidgets import (
 
 
 class VideoPlayerWidget(QWidget):
-    # Emitted whenever the playback position changes (milliseconds).
-    position_changed = pyqtSignal(int)
-    # Emitted when a new video is successfully loaded.
-    video_loaded = pyqtSignal(str)
+    position_changed = pyqtSignal(int)   # current position in ms
+    video_loaded     = pyqtSignal(str)   # path of newly loaded video
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -29,13 +31,14 @@ class VideoPlayerWidget(QWidget):
         self._current_frame = 0
         self._playing = False
 
-        # Legacy time-range overlay (mock data)
+        # Time-range overlay (mock data)
         # Format: [(start_ms, end_ms, label, color_rgb, nx, ny, nw, nh), ...]
         self._bounding_boxes: list = []
 
-        # Frame-indexed overlay (real YOLO output)
+        # Frame-indexed overlay (real YOLO / loaded JSON)
         # Format: {frame_index: [(label, color_rgb, nx, ny, nw, nh), ...]}
         self._frame_detections: dict[int, list] = {}
+        self._sorted_sample_frames: list[int] = []   # sorted keys of _frame_detections
         self._use_frame_detections = False
 
         self._build_ui()
@@ -82,7 +85,7 @@ class VideoPlayerWidget(QWidget):
         controls.addWidget(self._time_label)
         root.addLayout(controls)
 
-    # ------------------------------------------------------------------ public
+    # ------------------------------------------------------------------ public API
 
     def open_file_dialog(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -109,45 +112,43 @@ class VideoPlayerWidget(QWidget):
         self.video_loaded.emit(path)
 
     @property
-    def video_path(self) -> str | None:
-        if self._cap and self._cap.isOpened():
-            return self._cap.getBackendName()   # placeholder; real path stored by caller
-        return None
-
-    @property
     def fps(self) -> float:
         return self._fps
 
     @property
     def frame_width(self) -> int:
-        if self._cap:
-            return int(self._cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        return 0
+        return int(self._cap.get(cv2.CAP_PROP_FRAME_WIDTH)) if self._cap else 0
 
     @property
     def frame_height(self) -> int:
-        if self._cap:
-            return int(self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        return 0
+        return int(self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) if self._cap else 0
+
+    @property
+    def total_frames(self) -> int:
+        return self._total_frames
 
     def set_bounding_boxes(self, boxes: list):
-        """Mock-data / time-range overlay. Cleared when set_frame_detections is called."""
+        """Time-range mock overlay."""
         self._bounding_boxes = boxes
         self._use_frame_detections = False
         self._render_frame(self._current_frame)
 
     def set_frame_detections(self, detections: dict[int, list]):
         """
-        Real YOLO overlay. detections maps frame_index →
-        [(label, color_rgb, nx, ny, nw, nh), ...].
-        Takes priority over set_bounding_boxes once called.
+        Real YOLO / JSON overlay.
+        detections: {frame_index: [(label, color_rgb, nx, ny, nw, nh), ...]}
+
+        Frames between sampled indices show the nearest preceding sample's
+        boxes — no flickering even at high sample strides.
         """
         self._frame_detections = detections
+        self._sorted_sample_frames = sorted(detections.keys())
         self._use_frame_detections = True
         self._render_frame(self._current_frame)
 
     def clear_detections(self):
         self._frame_detections = {}
+        self._sorted_sample_frames = []
         self._bounding_boxes = []
         self._use_frame_detections = False
         self._render_frame(self._current_frame)
@@ -155,16 +156,12 @@ class VideoPlayerWidget(QWidget):
     # ------------------------------------------------------------------ playback
 
     def _toggle_play(self):
-        if self._playing:
-            self._stop()
-        else:
-            self._start()
+        self._stop() if self._playing else self._start()
 
     def _start(self):
         if not self._cap:
             return
-        interval_ms = max(1, int(1000 / self._fps))
-        self._timer.start(interval_ms)
+        self._timer.start(max(1, int(1000 / self._fps)))
         self._playing = True
         self._play_btn.setText("Pause")
 
@@ -200,7 +197,7 @@ class VideoPlayerWidget(QWidget):
 
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         h, w, ch = rgb.shape
-        qimg = QImage(rgb.data, w, h, ch * w, QImage.Format.Format_RGB888)
+        qimg  = QImage(rgb.data, w, h, ch * w, QImage.Format.Format_RGB888)
         pixmap = QPixmap.fromImage(qimg)
 
         active = self._get_active_boxes(frame_index, w, h)
@@ -237,16 +234,16 @@ class VideoPlayerWidget(QWidget):
     def _get_active_boxes(
         self, frame_index: int, w: int, h: int
     ) -> list[tuple]:
-        """Return list of (label, color, x_px, y_px, w_px, h_px) for this frame."""
+        """Return (label, color, x_px, y_px, w_px, h_px) for this frame."""
         if self._use_frame_detections:
-            boxes = self._frame_detections.get(frame_index, [])
+            boxes = self._lookup_nearest_sample(frame_index)
             return [
                 (label, color,
                  int(nx * w), int(ny * h), int(nw * w), int(nh * h))
                 for label, color, nx, ny, nw, nh in boxes
             ]
 
-        # Fall back to time-range mock boxes
+        # Time-range mock boxes
         current_ms = int(frame_index / self._fps * 1000)
         result = []
         for start_ms, end_ms, label, color, nx, ny, nw, nh in self._bounding_boxes:
@@ -256,6 +253,24 @@ class VideoPlayerWidget(QWidget):
                      int(nx * w), int(ny * h), int(nw * w), int(nh * h))
                 )
         return result
+
+    def _lookup_nearest_sample(self, frame_index: int) -> list:
+        """
+        Return the detection list for frame_index if it was sampled, otherwise
+        fall back to the most-recently-sampled frame before frame_index.
+        This prevents boxes from disappearing between sample points.
+        """
+        if not self._sorted_sample_frames:
+            return []
+        # Exact hit
+        boxes = self._frame_detections.get(frame_index)
+        if boxes is not None:
+            return boxes
+        # Nearest preceding sample
+        pos = bisect.bisect_right(self._sorted_sample_frames, frame_index) - 1
+        if pos >= 0:
+            return self._frame_detections.get(self._sorted_sample_frames[pos], [])
+        return []
 
     @staticmethod
     def _fmt(seconds: float) -> str:

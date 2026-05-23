@@ -18,7 +18,7 @@ import cv2
 
 DEFAULT_MODEL = "yolo11n.pt"          # auto-downloads on first run (~5 MB)
 DEFAULT_CONF_THRESHOLD = 0.40         # minimum detection confidence
-DEFAULT_FRAME_STRIDE = 2              # process every Nth frame (1 = every frame)
+DEFAULT_FRAME_STRIDE = 1              # process every Nth frame (1 = every frame, the default)
 
 # Classes the detector will keep; all others are silently dropped.
 # Tune this list to match objects found in your playroom sessions.

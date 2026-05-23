@@ -2,18 +2,25 @@
 # Defines the JSON results schema used by both CLI output and UI loading.
 # No dependency on PyQt6 — pure processing code safe to import on Colab.
 #
-# Schema overview:
+# Schema v1.1 changes from v1.0:
+#   • frame_detections now stores RAW FrameDetections (bbox / label / confidence only).
+#     The mapper-derived fields (is_child, interaction, is_interacting_with) are no
+#     longer stored — they are recomputed on load / whenever a threshold slider moves.
+#   • frame_detections["capture_conf_floor"] records the YOLO floor used at capture
+#     time so the UI can warn when a slider is set below that floor.
+#
+# Schema overview (v1.1):
 #   {
-#     "schema_version": "1.0",
+#     "schema_version": "1.1",
 #     "video_info":   { filename, frame_width, frame_height, fps, total_frames },
 #     "processing":   { date, settings, modules_used },
 #     "segments":     [ { start_time, end_time, label, object, yolo_confidence,
 #                         action_confidence, action_source }, ... ],
 #     "frame_detections": {
+#       "capture_conf_floor": 0.05,
 #       "frames": {
 #         "<frame_index>": [
-#           { bbox:[x1,y1,x2,y2], label, confidence, is_child, interaction,
-#             is_interacting_with }, ...
+#           { "bbox": [x1,y1,x2,y2], "label": str, "confidence": float }, ...
 #         ], ...
 #       }
 #     }
@@ -24,13 +31,8 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
-SCHEMA_VERSION = "1.0"
-
-# Colors for converting JSON detections back to the UI overlay format.
-# Must stay in sync with SegmentBuilder color constants.
-_COLOR_CHILD       = (255, 130,  50)
-_COLOR_INTERACTING = ( 60, 220,  90)
-_COLOR_PASSIVE     = ( 80, 160, 255)
+SCHEMA_VERSION    = "1.1"
+CAPTURE_CONF_FLOOR = 0.05   # YOLO floor used when producing new JSONs
 
 
 # ---------------------------------------------------------------------------
@@ -42,8 +44,8 @@ def save_results(
     video_path: str | Path,
     settings: dict,
     modules_used: dict,
-    segments: list,       # list[Segment] from segment_builder
-    mapped_frames: list,  # list[MappedFrame] from interaction_mapper
+    segments: list,     # list[Segment] from segment_builder
+    raw_frames: list,   # list[FrameDetections] from yolo_detector — at capture floor
     fps: float,
     frame_w: int,
     frame_h: int,
@@ -52,26 +54,29 @@ def save_results(
     """
     Serialize analysis results to a JSON file.
 
-    segments      — list[backend.segment_builder.Segment]
-    mapped_frames — list[backend.interaction_mapper.MappedFrame]
+    segments   — list[backend.segment_builder.Segment]
+    raw_frames — list[backend.yolo_detector.FrameDetections] captured at
+                 CAPTURE_CONF_FLOOR (0.05).  Storing raw detections lets the
+                 UI recompute interactions and segments live when thresholds change.
     """
     doc = {
         "schema_version": SCHEMA_VERSION,
         "video_info": {
-            "filename": Path(video_path).name,
-            "frame_width": frame_w,
+            "filename":     Path(video_path).name,
+            "frame_width":  frame_w,
             "frame_height": frame_h,
-            "fps": fps,
+            "fps":          fps,
             "total_frames": total_frames,
         },
         "processing": {
-            "date": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "settings": settings,
+            "date":         datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "settings":     settings,
             "modules_used": modules_used,
         },
         "segments": _serialize_segments(segments),
         "frame_detections": {
-            "frames": _serialize_mapped_frames(mapped_frames),
+            "capture_conf_floor": settings.get("capture_conf_floor", CAPTURE_CONF_FLOOR),
+            "frames": _serialize_raw_frames(raw_frames),
         },
     }
 
@@ -85,11 +90,11 @@ def _serialize_segments(segments: list) -> list:
     out = []
     for s in segments:
         out.append({
-            "start_time": _ms_to_hms_ms(s.start_ms),
-            "end_time":   _ms_to_hms_ms(s.end_ms),
-            "label":      f"{s.interaction_type} {s.object_label}",
-            "action":     s.interaction_type,
-            "object":     s.object_label,
+            "start_time":        _ms_to_hms_ms(s.start_ms),
+            "end_time":          _ms_to_hms_ms(s.end_ms),
+            "label":             f"{s.interaction_type} {s.object_label}",
+            "action":            s.interaction_type,
+            "object":            s.object_label,
             "yolo_confidence":   round(s.yolo_confidence, 4),
             "action_confidence": round(s.action_confidence, 4),
             "action_source":     s.action_source,
@@ -97,27 +102,24 @@ def _serialize_segments(segments: list) -> list:
     return out
 
 
-def _serialize_mapped_frames(mapped_frames: list) -> dict:
+def _serialize_raw_frames(raw_frames: list) -> dict:
+    """
+    Serialize raw FrameDetections (YOLO output) to JSON.
+    Only bbox / label / confidence are stored — mapper-derived fields are
+    recomputed on demand, so they are not persisted.
+    """
     frames: dict[str, list] = {}
-    for mf in mapped_frames:
-        detections = []
-        for md in mf.objects:
-            d = md.detection
-            det: dict = {
+    for fd in raw_frames:
+        if not fd.detections:
+            continue
+        frames[str(fd.frame_index)] = [
+            {
                 "bbox":       [d.x1, d.y1, d.x2, d.y2],
                 "label":      d.label,
                 "confidence": round(d.confidence, 4),
-                "is_child":   md.is_child,
-                "interaction": md.interaction.name,  # "NONE"|"OVERLAP"|"PROXIMITY"
             }
-            # is_interacting_with mirrors what the UI uses for colouring
-            if not md.is_child and md.interaction.name != "NONE":
-                det["is_interacting_with"] = "person"
-            else:
-                det["is_interacting_with"] = None
-            detections.append(det)
-        if detections:
-            frames[str(mf.frame_index)] = detections
+            for d in fd.detections
+        ]
     return frames
 
 
@@ -128,8 +130,8 @@ def _serialize_mapped_frames(mapped_frames: list) -> dict:
 def load_results(json_path: str | Path) -> dict:
     """
     Load and lightly validate a results JSON file.
-    Raises ValueError if the file is missing required keys.
-    Returns the raw parsed dict.
+    Raises ValueError if required keys are missing.
+    Returns the raw parsed dict; supports both schema v1.0 and v1.1.
     """
     with open(json_path, "r", encoding="utf-8") as f:
         data = json.load(f)
@@ -142,12 +144,49 @@ def load_results(json_path: str | Path) -> dict:
             f"Results JSON is missing required keys: {missing}\n"
             f"File: {json_path}"
         )
-
     return data
 
 
 # ---------------------------------------------------------------------------
-# Converters for the UI
+# Reconstruction — raw frames → FrameDetections (for live refilter)
+# ---------------------------------------------------------------------------
+
+def raw_frames_to_frame_detections(frames_json: dict, fps: float) -> list:
+    """
+    Reconstruct a list[FrameDetections] from the JSON frame_detections["frames"].
+
+    Compatible with both schema v1.0 (has extra mapper-derived keys which are
+    silently ignored) and v1.1 (stores only bbox/label/confidence).
+
+    Returns frames sorted by frame_index.
+    """
+    from backend.yolo_detector import FrameDetections, Detection
+
+    result = []
+    for frame_str, dets in frames_json.items():
+        frame_idx = int(frame_str)
+        ts_ms     = frame_idx / fps * 1000.0
+        detections = [
+            Detection(
+                label=d["label"],
+                confidence=d["confidence"],
+                x1=d["bbox"][0], y1=d["bbox"][1],
+                x2=d["bbox"][2], y2=d["bbox"][3],
+            )
+            for d in dets
+        ]
+        result.append(FrameDetections(
+            frame_index=frame_idx,
+            timestamp_ms=ts_ms,
+            detections=detections,
+        ))
+
+    result.sort(key=lambda fd: fd.frame_index)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Converters for legacy / export use
 # ---------------------------------------------------------------------------
 
 def segments_to_table_rows(segments_json: list) -> list[tuple]:
@@ -168,43 +207,6 @@ def segments_to_table_rows(segments_json: list) -> list[tuple]:
         ac_s  = f"{ac:.2f}" if ac else "—"
         rows.append((start, end, label, obj, yc_s, ac_s))
     return rows
-
-
-def frame_detections_to_ui_boxes(
-    frames_json: dict,
-    frame_w: int,
-    frame_h: int,
-) -> dict[int, list]:
-    """
-    Convert JSON frame_detections["frames"] →
-    {frame_index: [(label, color_rgb, nx, ny, nw, nh), ...]}
-    as expected by VideoPlayerWidget.set_frame_detections().
-    """
-    result: dict[int, list] = {}
-    for frame_str, detections in frames_json.items():
-        frame_idx = int(frame_str)
-        boxes = []
-        for det in detections:
-            x1, y1, x2, y2 = det["bbox"]
-            is_child = det.get("is_child", False)
-            interacting = det.get("is_interacting_with") is not None
-
-            if is_child:
-                color = _COLOR_CHILD
-            elif interacting:
-                color = _COLOR_INTERACTING
-            else:
-                color = _COLOR_PASSIVE
-
-            nx = x1 / frame_w if frame_w else 0.0
-            ny = y1 / frame_h if frame_h else 0.0
-            nw = (x2 - x1) / frame_w if frame_w else 0.0
-            nh = (y2 - y1) / frame_h if frame_h else 0.0
-            boxes.append((det["label"], color, nx, ny, nw, nh))
-
-        if boxes:
-            result[frame_idx] = boxes
-    return result
 
 
 def default_output_path(video_path: str | Path) -> Path:

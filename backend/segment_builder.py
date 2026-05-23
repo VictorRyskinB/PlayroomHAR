@@ -15,9 +15,11 @@ from backend.interaction_mapper import MappedFrame, InteractionKind
 # Configurable constants
 # ---------------------------------------------------------------------------
 
-MIN_SEGMENT_DURATION_MS = 500    # ignore interactions shorter than this
-SAME_OBJECT_GAP_MS      = 1000   # merge consecutive same-object segments
+MIN_SEGMENT_DURATION_MS = 200    # ignore interactions shorter than this
+                                 # (lowered from 500 ms — catches brief contacts)
+SAME_OBJECT_GAP_MS      = 2000   # merge consecutive same-object segments
                                  # if the gap between them is ≤ this value
+                                 # (raised from 1000 ms — joins near-miss runs)
 
 # ---------------------------------------------------------------------------
 # Data types

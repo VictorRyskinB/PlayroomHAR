@@ -17,11 +17,23 @@ import cv2
 # ---------------------------------------------------------------------------
 
 DEFAULT_MODEL = "yolo11n.pt"          # auto-downloads on first run (~5 MB)
-DEFAULT_CONF_THRESHOLD = 0.40         # minimum detection confidence
 DEFAULT_FRAME_STRIDE = 1              # process every Nth frame (1 = every frame, the default)
 
-# Classes the detector will keep; all others are silently dropped.
-# Tune this list to match objects found in your playroom sessions.
+# CAPTURE_CONF_FLOOR is the minimum confidence used when running YOLO in UI mode.
+# All detections above this floor are stored in the JSON so that the display
+# threshold slider can be adjusted post-hoc without re-running YOLO.
+# In CLI mode, --yolo-confidence acts as a pre-mapper filter applied to the
+# captured detections (so the CLI JSON also stores everything ≥ 0.05).
+CAPTURE_CONF_FLOOR = 0.05
+
+# Default for the UI confidence spinbox initial value (display threshold).
+DEFAULT_CONF_THRESHOLD = 0.25
+
+# Classes the detector will keep when the class filter is active.
+# Pass allowed_classes=None to YoloDetector to accept every detected class —
+# that is the recommended mode for real playroom videos where toys are unlikely
+# to match standard COCO class names.
+#
 # "person" must stay — the interaction mapper depends on it.
 DEFAULT_CLASSES: set[str] = {
     "person",
@@ -35,10 +47,27 @@ DEFAULT_CLASSES: set[str] = {
     "remote",
     "cell phone",
     "backpack",
+    "handbag",
+    "suitcase",
+    "umbrella",
+    "tie",
+    "frisbee",
+    "kite",
+    "baseball bat",
+    "baseball glove",
+    "skateboard",
+    "surfboard",
+    "tennis racket",
     "cat",
     "dog",
     "chair",
     "couch",
+    "potted plant",
+    "bed",
+    "dining table",
+    "keyboard",
+    "laptop",
+    "mouse",
     "toy",           # present in some fine-tuned COCO variants
 }
 
@@ -104,12 +133,19 @@ class YoloDetector:
         self,
         model_name: str = DEFAULT_MODEL,
         conf_threshold: float = DEFAULT_CONF_THRESHOLD,
-        allowed_classes: set[str] | None = None,
+        allowed_classes: set[str] | None = DEFAULT_CLASSES,
         frame_stride: int = DEFAULT_FRAME_STRIDE,
     ):
+        """
+        allowed_classes:
+            DEFAULT_CLASSES  — keep only the curated playroom class list (default).
+            None             — accept every class the model detects. Use this for
+                               real playroom videos where toys are unlikely to match
+                               standard COCO class names (recommended).
+        """
         self._model_name = model_name
         self._conf = conf_threshold
-        self._allowed = allowed_classes if allowed_classes is not None else DEFAULT_CLASSES
+        self._allowed = allowed_classes   # None = no filter (all classes)
         self._stride = max(1, frame_stride)
         self._model = None   # lazy-loaded on first run() call
 
@@ -117,15 +153,19 @@ class YoloDetector:
         from ultralytics import YOLO
         print(f"[YoloDetector] Loading model: {self._model_name}")
         self._model = YOLO(self._model_name)
-        # Log all class names so researchers can tune the filter list
         names = self._model.names  # dict {int: str}
-        print(f"[YoloDetector] Model has {len(names)} classes. "
-              f"Active filter keeps: {sorted(self._allowed)}")
-        present = {n for n in names.values() if n in self._allowed}
-        absent  = self._allowed - present
-        if absent:
-            print(f"[YoloDetector] WARNING — these filter classes are NOT in "
-                  f"the model vocabulary: {sorted(absent)}")
+        if self._allowed is None:
+            print(f"[YoloDetector] Class filter: DISABLED — accepting all "
+                  f"{len(names)} model classes.")
+        else:
+            print(f"[YoloDetector] Class filter active — keeping "
+                  f"{len(self._allowed)} of {len(names)} classes: "
+                  f"{sorted(self._allowed)}")
+            present = {n for n in names.values() if n in self._allowed}
+            absent  = self._allowed - present
+            if absent:
+                print(f"[YoloDetector] WARNING — these filter classes are NOT in "
+                      f"the model vocabulary: {sorted(absent)}")
 
     def run(
         self,
@@ -170,8 +210,33 @@ class YoloDetector:
                     last_pct = pct
 
         cap.release()
-        print(f"[YoloDetector] Processed {len(results)} frames "
+
+        # Detailed summary — helps diagnose why no segments appear
+        n_frames = len(results)
+        n_with_person  = sum(1 for fd in results
+                             if any(d.label == "person" for d in fd.detections))
+        n_with_objects = sum(1 for fd in results
+                             if any(d.label != "person" for d in fd.detections))
+        # Tally every detected class (excluding person) for the researcher
+        class_counts: dict[str, int] = {}
+        for fd in results:
+            for d in fd.detections:
+                if d.label != "person":
+                    class_counts[d.label] = class_counts.get(d.label, 0) + 1
+        print(f"[YoloDetector] Processed {n_frames} frames "
               f"({frame_idx} total, stride={self._stride}).")
+        print(f"[YoloDetector]   Frames with person  : {n_with_person}")
+        print(f"[YoloDetector]   Frames with objects : {n_with_objects}")
+        if class_counts:
+            top = sorted(class_counts.items(), key=lambda x: -x[1])[:10]
+            print(f"[YoloDetector]   Top object classes : "
+                  + ", ".join(f"{k}({v})" for k, v in top))
+        else:
+            print("[YoloDetector]   *** No objects detected — "
+                  "this will produce zero interaction segments. ***")
+            if self._allowed is not None:
+                print("[YoloDetector]   Tip: try enabling 'All objects' mode "
+                      "to bypass the class filter.")
         return results
 
     def _process_frame(
@@ -192,7 +257,7 @@ class YoloDetector:
             label      = names.get(cls_id, str(cls_id))
             confidence = float(box.conf[0])
 
-            if label not in self._allowed:
+            if self._allowed is not None and label not in self._allowed:
                 continue
 
             x1, y1, x2, y2 = (int(v) for v in box.xyxy[0])

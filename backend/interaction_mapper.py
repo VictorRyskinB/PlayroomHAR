@@ -26,7 +26,8 @@ from backend.yolo_detector import FrameDetections, Detection
 # ---------------------------------------------------------------------------
 
 IOU_THRESHOLD       = 0.05   # minimum IoU to count as overlapping interaction
-PROXIMITY_THRESHOLD = 80     # pixel distance between edges for proximity fallback
+PROXIMITY_THRESHOLD = 150    # pixel distance between edges for proximity fallback
+                             # (increased from 80 — HD video makes 80 px too tight)
 CHILD_LABEL         = "person"
 
 # ---------------------------------------------------------------------------

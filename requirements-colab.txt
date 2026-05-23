@@ -1,0 +1,9 @@
+# Colab / headless requirements — no GUI packages
+# Use this instead of requirements.txt when running on Google Colab or any
+# headless Linux environment where PyQt6 is not needed.
+#
+# opencv-python-headless avoids pulling in libGL / display server deps
+# that are absent on Colab and cause the full opencv-python to fail.
+
+opencv-python-headless>=4.8.0
+ultralytics>=8.0.0

@@ -33,6 +33,8 @@ from PyQt6.QtWidgets import (
 from ui.video_player import VideoPlayerWidget
 from ui.results_table import GenericTableWidget
 
+_DEFAULT_REGIONS_PATH = Path(__file__).parent.parent / "default.regions.json"
+
 
 # ---------------------------------------------------------------------------
 # Themes and parametrized stylesheet
@@ -620,6 +622,7 @@ class MainWindow(QMainWindow):
         self._load_settings()
         # Re-apply stylesheet so saved font/theme preferences take effect on startup
         self.setStyleSheet(_make_qss(self._font_size, self._theme_name))
+        self._autoload_regions()
 
     # ------------------------------------------------------------------ layout
 
@@ -1338,12 +1341,32 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self._status.showMessage(f"Failed to load regions: {exc}")
 
-    def _update_region_ui(self):
+    def _autoload_regions(self):
+        if _DEFAULT_REGIONS_PATH.exists():
+            try:
+                from backend.region_config import load_region_config
+                _, regions = load_region_config(_DEFAULT_REGIONS_PATH)
+                self._regions = regions
+                self._video.set_regions(self._regions)
+                self._update_region_ui(save=False)
+            except Exception:
+                pass
+
+    def _autosave_regions(self):
+        try:
+            from backend.region_config import save_region_config
+            save_region_config(_DEFAULT_REGIONS_PATH, "default", self._regions)
+        except Exception:
+            pass
+
+    def _update_region_ui(self, save: bool = True):
         n = len(self._regions)
         self._region_count_lbl.setText(f"{n} region{'s' if n != 1 else ''}")
         has = n > 0
         self._clear_regions_btn.setEnabled(has)
         self._save_regions_btn.setEnabled(has)
+        if save:
+            self._autosave_regions()
 
     # ------------------------------------------------------------------ JSON loading
 
@@ -2798,6 +2821,16 @@ def _fmt_dur(dur_ms: float) -> str:
     return f"{m}m {s:.0f}s"
 
 
+def _foot_region_overlap(person, rx1: float, ry1: float, rx2: float, ry2: float) -> float:
+    """
+    Horizontal overlap length between the person's foot-line and a region.
+    Returns 0 if the foot y (person.y2) is outside the region's y-range.
+    """
+    if not (ry1 <= person.y2 <= ry2):
+        return 0.0
+    return max(0.0, min(person.x2, rx2) - max(person.x1, rx1))
+
+
 def _compute_region_segments(
     raw_frames: list,
     conf: float,
@@ -2808,13 +2841,10 @@ def _compute_region_segments(
     gap_tolerance_ms: int = 1000,
 ) -> list[dict]:
     """
-    For each named region, find continuous time spans where a person
-    (YOLO conf ≥ conf) was detected inside that region's bounding box.
-
-    Person overlap uses the same IoU-free test as InteractionMapper:
-    the person bbox (absolute pixels) vs. the region bbox (denormalised).
-    Two frames are considered continuous if the time gap between them is
-    ≤ gap_tolerance_ms (default 1 s — covers up to ~30-frame strides).
+    For each frame, assign the person to the region whose x-span overlaps
+    the most with the person's foot-line (bottom bbox edge).  When multiple
+    regions qualify, the one with the greatest horizontal overlap wins —
+    so the assignment shifts naturally as the person crosses a boundary.
 
     Returns a list of dicts sorted by start_ms:
         {"start_ms", "end_ms", "region", "frames"}
@@ -2822,61 +2852,71 @@ def _compute_region_segments(
     if not regions or not raw_frames:
         return []
 
+    # Pre-compute pixel coords for each region once
+    reg_boxes = [
+        (r["name"],
+         r["nx"] * fw,
+         r["ny"] * fh,
+         (r["nx"] + r["nw"]) * fw,
+         (r["ny"] + r["nh"]) * fh)
+        for r in regions
+    ]
+
+    # Per-region open-segment state
+    state = {name: {"start": None, "end": None, "frames": 0}
+             for name, *_ in reg_boxes}
+
     segments: list[dict] = []
 
-    for region in regions:
-        rx1 = region["nx"] * fw
-        ry1 = region["ny"] * fh
-        rx2 = rx1 + region["nw"] * fw
-        ry2 = ry1 + region["nh"] * fh
-        rname = region["name"]
+    def _close(rname: str) -> None:
+        s = state[rname]
+        if s["start"] is None:
+            return
+        dur = s["end"] - s["start"]
+        if dur >= min_dur_ms:
+            segments.append({
+                "start_ms": s["start"],
+                "end_ms":   s["end"],
+                "region":   rname,
+                "frames":   s["frames"],
+            })
+        s["start"] = s["end"] = None
+        s["frames"] = 0
 
-        cur_start   = None
-        cur_end     = None
-        cur_frames  = 0
+    for fd in raw_frames:
+        persons = [
+            d for d in fd.detections
+            if d.label == "person" and d.confidence >= conf
+        ]
 
-        for fd in raw_frames:
-            persons = [
-                d for d in fd.detections
-                if d.label == "person" and d.confidence >= conf
-            ]
-            in_region = any(
-                d.x1 < rx2 and d.x2 > rx1 and d.y1 < ry2 and d.y2 > ry1
-                for d in persons
-            )
+        # Use the largest person bbox when multiple are detected
+        person = max(persons, key=lambda d: d.area) if persons else None
 
-            if in_region:
-                if cur_start is None:
-                    cur_start  = fd.timestamp_ms
-                    cur_frames = 0
-                cur_end     = fd.timestamp_ms
-                cur_frames += 1
-            else:
-                # Close segment if person left AND gap exceeded tolerance
-                if cur_start is not None:
-                    gap = fd.timestamp_ms - cur_end
-                    if gap > gap_tolerance_ms:
-                        dur = cur_end - cur_start
-                        if dur >= min_dur_ms:
-                            segments.append({
-                                "start_ms": cur_start,
-                                "end_ms":   cur_end,
-                                "region":   rname,
-                                "frames":   cur_frames,
-                            })
-                        cur_start  = None
-                        cur_end    = None
-                        cur_frames = 0
+        # Winner = region with greatest foot-line horizontal overlap
+        best_region: str | None = None
+        if person is not None:
+            best_overlap = 0.0
+            for rname, rx1, ry1, rx2, ry2 in reg_boxes:
+                overlap = _foot_region_overlap(person, rx1, ry1, rx2, ry2)
+                if overlap > best_overlap:
+                    best_overlap = overlap
+                    best_region = rname
 
-        # Close any segment still open at end of video
-        if cur_start is not None:
-            dur = cur_end - cur_start
-            if dur >= min_dur_ms:
-                segments.append({
-                    "start_ms": cur_start,
-                    "end_ms":   cur_end,
-                    "region":   rname,
-                    "frames":   cur_frames,
-                })
+        for rname, *_ in reg_boxes:
+            s = state[rname]
+            if rname == best_region:
+                if s["start"] is None:
+                    s["start"]  = fd.timestamp_ms
+                    s["frames"] = 0
+                s["end"]     = fd.timestamp_ms
+                s["frames"] += 1
+            elif s["start"] is not None:
+                gap = fd.timestamp_ms - s["end"]
+                if gap > gap_tolerance_ms:
+                    _close(rname)
+
+    # Close any segments still open at end of video
+    for rname, *_ in reg_boxes:
+        _close(rname)
 
     return sorted(segments, key=lambda s: s["start_ms"])

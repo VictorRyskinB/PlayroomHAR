@@ -18,6 +18,7 @@
 # sample rather than going blank (sorted index + bisect).
 
 import bisect
+import time
 import cv2
 from PyQt6.QtCore import Qt, QTimer, QRect, pyqtSignal
 from PyQt6.QtGui import QImage, QPixmap, QPainter, QPen, QColor, QFont
@@ -170,6 +171,8 @@ class VideoPlayerWidget(QWidget):
         self._fps = 30.0
         self._current_frame = 0
         self._playing = False
+        self._play_start_time: float = 0.0
+        self._play_start_frame: int  = 0
 
         # Time-range overlay (mock data)
         # Format: [(start_ms, end_ms, label, color_rgb, nx, ny, nw, nh), ...]
@@ -370,7 +373,9 @@ class VideoPlayerWidget(QWidget):
     def _start(self):
         if not self._cap:
             return
-        self._timer.start(max(1, int(1000 / self._fps)))
+        self._play_start_time  = time.monotonic()
+        self._play_start_frame = self._current_frame
+        self._timer.start(16)  # poll at ~60 Hz; wall clock decides actual frame
         self._playing = True
         self._play_btn.setText("Pause")
 
@@ -380,11 +385,22 @@ class VideoPlayerWidget(QWidget):
         self._play_btn.setText("Play")
 
     def _advance_frame(self):
-        if self._current_frame >= self._total_frames - 1:
+        elapsed = time.monotonic() - self._play_start_time
+        target  = self._play_start_frame + int(elapsed * self._fps)
+        target  = min(target, self._total_frames - 1)
+
+        if target <= self._current_frame:
+            return  # not time for the next frame yet
+
+        if target >= self._total_frames - 1:
+            self._current_frame = self._total_frames - 1
+            self._render_frame(self._current_frame)
             self._stop()
             return
-        self._current_frame += 1
-        self._render_frame(self._current_frame)
+
+        sequential      = (target - self._current_frame) == 1
+        self._current_frame = target
+        self._render_frame(self._current_frame, sequential=sequential)
 
     def _seek_to(self, frame_index: int):
         was_playing = self._playing
@@ -392,14 +408,15 @@ class VideoPlayerWidget(QWidget):
         self._current_frame = frame_index
         self._render_frame(frame_index)
         if was_playing:
-            self._start()
+            self._start()  # resets _play_start_time/_play_start_frame
 
     # ------------------------------------------------------------------ rendering
 
-    def _render_frame(self, frame_index: int):
+    def _render_frame(self, frame_index: int, sequential: bool = False):
         if not self._cap:
             return
-        self._cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+        if not sequential:
+            self._cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
         ok, bgr = self._cap.read()
         if not ok:
             return
@@ -466,10 +483,15 @@ class VideoPlayerWidget(QWidget):
 
         painter.end()
 
+        transform = (
+            Qt.TransformationMode.FastTransformation
+            if self._playing
+            else Qt.TransformationMode.SmoothTransformation
+        )
         scaled = pixmap.scaled(
             self._frame_label.size(),
             Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
+            transform,
         )
         self._frame_label.setPixmap(scaled)
 

@@ -57,6 +57,7 @@ class PathMapWidget(QWidget):
         self._show_path    = True
         self._show_heatmap = True
         self._show_regions = True
+        self._time_cutoff_ms: float | None = None  # None = show all; set in live-path mode
 
         self.setSizePolicy(
             QSizePolicy.Policy.Expanding,
@@ -99,6 +100,14 @@ class PathMapWidget(QWidget):
 
     def set_show_regions(self, v: bool):
         self._show_regions = v
+        self.update()
+
+    def set_time_cutoff(self, ms: float | None):
+        """
+        Restrict the path line to points with timestamp_ms <= ms.
+        Pass None to show the full path (non-live mode).
+        """
+        self._time_cutoff_ms = ms
         self.update()
 
     def clear(self):
@@ -216,17 +225,21 @@ class PathMapWidget(QWidget):
         painter: QPainter,
         rx: float, ry: float, rw: float, rh: float,
     ):
+        cutoff = self._time_cutoff_ms
         pts = [p for p in self._path_points
-               if p.x_cm is not None and p.y_cm is not None]
+               if p.x_cm is not None and p.y_cm is not None
+               and (cutoff is None or p.timestamp_ms <= cutoff)]
         if not pts:
-            # No calibrated points — show a pixel-space hint
-            painter.setPen(QPen(QColor("#445566")))
-            painter.setFont(QFont("Arial", 9))
-            painter.drawText(
-                QRectF(rx, ry, rw, rh),
-                Qt.AlignmentFlag.AlignCenter,
-                "Calibrate camera\nto see floor path",
-            )
+            if cutoff is None:
+                # Full-path mode, no calibrated points → show calibration hint
+                painter.setPen(QPen(QColor("#445566")))
+                painter.setFont(QFont("Arial", 9))
+                painter.drawText(
+                    QRectF(rx, ry, rw, rh),
+                    Qt.AlignmentFlag.AlignCenter,
+                    "Calibrate camera\nto see floor path",
+                )
+            # Live mode with no points in range yet: show empty room silently
             return
 
         n = len(pts)

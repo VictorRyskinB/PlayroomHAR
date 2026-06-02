@@ -294,6 +294,14 @@ class _CalibPointDialog(QDialog):
 
 
 # ---------------------------------------------------------------------------
+# Worker cancellation sentinel
+# ---------------------------------------------------------------------------
+
+class _WorkerCancelled(Exception):
+    """Raised inside a progress callback to abort a running worker cleanly."""
+
+
+# ---------------------------------------------------------------------------
 # Worker: YOLO-only
 # ---------------------------------------------------------------------------
 
@@ -323,6 +331,15 @@ class _YoloWorker(QObject):
         self._yolo_model     = yolo_model
         self._world_classes  = world_classes
         self._enabled_mm     = enabled_mm_models   # unused in YOLO-only, kept for symmetry
+        self._cancelled      = False
+
+    def cancel(self):
+        self._cancelled = True
+
+    def _progress_cb(self, pct: int):
+        if self._cancelled:
+            raise _WorkerCancelled()
+        self.progress.emit(pct)
 
     def run(self):
         try:
@@ -347,7 +364,7 @@ class _YoloWorker(QObject):
             )
             raw_frames = detector.run(
                 self._path,
-                progress_cb=lambda p: self.progress.emit(p),
+                progress_cb=self._progress_cb,
             )
 
             n_frames  = len(raw_frames)
@@ -394,6 +411,9 @@ class _YoloWorker(QObject):
             self.progress.emit(100)
             self.finished.emit(raw_frames, [], diag)
 
+        except _WorkerCancelled:
+            self.status.emit("Cancelled.")
+            self.finished.emit([], [], "Cancelled")
         except Exception as exc:
             import traceback; traceback.print_exc()
             self.error.emit(str(exc))
@@ -428,6 +448,20 @@ class _FullAnalysisWorker(QObject):
         self._yolo_model     = yolo_model
         self._world_classes  = world_classes
         self._enabled_mm     = enabled_mm_models
+        self._cancelled      = False
+
+    def cancel(self):
+        self._cancelled = True
+
+    def _progress_yolo(self, pct: int):
+        if self._cancelled:
+            raise _WorkerCancelled()
+        self.progress.emit(pct // 2)
+
+    def _progress_mm(self, pct: int):
+        if self._cancelled:
+            raise _WorkerCancelled()
+        self.progress.emit(50 + pct * 40 // 100)
 
     def run(self):
         try:
@@ -452,7 +486,7 @@ class _FullAnalysisWorker(QObject):
             )
             raw_frames = detector.run(
                 self._path,
-                progress_cb=lambda p: self.progress.emit(p // 2),
+                progress_cb=self._progress_yolo,
             )
 
             n_frames  = len(raw_frames)
@@ -479,7 +513,7 @@ class _FullAnalysisWorker(QObject):
             if recognizer.is_available():
                 action_clips = recognizer.recognize(
                     self._path,
-                    progress_cb=lambda p: self.progress.emit(50 + p * 40 // 100),
+                    progress_cb=self._progress_mm,
                 )
                 mmaction2_used = bool(action_clips)
             else:
@@ -519,6 +553,9 @@ class _FullAnalysisWorker(QObject):
             self.progress.emit(100)
             self.finished.emit(raw_frames, action_clips, diag)
 
+        except _WorkerCancelled:
+            self.status.emit("Cancelled.")
+            self.finished.emit([], [], "Cancelled")
         except Exception as exc:
             import traceback; traceback.print_exc()
             self.error.emit(str(exc))
@@ -538,6 +575,15 @@ class _MMAction2Worker(QObject):
         super().__init__()
         self._path         = video_path
         self._enabled_mm   = enabled_models
+        self._cancelled    = False
+
+    def cancel(self):
+        self._cancelled = True
+
+    def _progress_cb(self, pct: int):
+        if self._cancelled:
+            raise _WorkerCancelled()
+        self.progress.emit(pct)
 
     def run(self):
         try:
@@ -556,12 +602,15 @@ class _MMAction2Worker(QObject):
             self.status.emit("MMAction2 — running action recognition…")
             action_clips = recognizer.recognize(
                 self._path,
-                progress_cb=lambda p: self.progress.emit(p),
+                progress_cb=self._progress_cb,
             )
             diag = f"MMAction2: {len(action_clips)} clips captured from {self._path}"
             self.progress.emit(100)
             self.finished.emit(action_clips, diag)
 
+        except _WorkerCancelled:
+            self.status.emit("Cancelled.")
+            self.finished.emit([], "Cancelled")
         except Exception as exc:
             import traceback; traceback.print_exc()
             self.error.emit(str(exc))
@@ -589,6 +638,15 @@ class _PathTrackingWorker(QObject):
         self._model    = yolo_model
         self._matrix   = homography_matrix
         self._room     = room_size_cm
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
+
+    def _progress_cb(self, pct: int):
+        if self._cancelled:
+            raise _WorkerCancelled()
+        self.progress.emit(pct)
 
     def run(self):
         try:
@@ -602,7 +660,7 @@ class _PathTrackingWorker(QObject):
             )
             track_pts = det.run(
                 self._path,
-                progress_cb=lambda p: self.progress.emit(p),
+                progress_cb=self._progress_cb,
             )
 
             path_pts = build_path_points(track_pts, self._matrix)
@@ -618,6 +676,9 @@ class _PathTrackingWorker(QObject):
             self.progress.emit(100)
             self.finished.emit(path_pts, diag)
 
+        except _WorkerCancelled:
+            self.status.emit("Cancelled.")
+            self.finished.emit([], "Cancelled")
         except Exception as exc:
             import traceback; traceback.print_exc()
             self.error.emit(str(exc))
@@ -659,6 +720,8 @@ class MainWindow(QMainWindow):
 
         # Path tracking state
         self._path_points: list = []          # list[PathPoint]
+        self._path_stats = None               # PathStats | None
+        self._path_live_mode: bool = False    # True = path follows video playhead
         self._homography_matrix = None        # np.ndarray 3×3 or None
         self._room_size_cm: tuple = (250, 600)
 
@@ -677,6 +740,7 @@ class MainWindow(QMainWindow):
         # Seekbar highlight state (which table row is currently highlighted)
         self._hl_tab: int = -1          # 0/1/2 = which tab; -1 = none
         self._hl_src_row: int = -1      # source-model row index
+        self._last_position_ms: int = 0 # last known video position (live path)
 
         # Debounce timer — refilter fires 250 ms after the last slider change
         self._refilter_timer = QTimer(self)
@@ -838,8 +902,22 @@ class MainWindow(QMainWindow):
         toolbar.addWidget(self._track_path_btn)
         toolbar.addWidget(self._calibrate_btn)
         toolbar.addWidget(self._load_json_btn)
+        self._cancel_btn = QPushButton("✕  Cancel")
+        self._cancel_btn.setVisible(False)
+        self._cancel_btn.setStyleSheet(
+            "QPushButton { color: #ff6666; border-color: #884444; }"
+            "QPushButton:hover { background: #4e2222; }"
+            "QPushButton:disabled { color: #664444; border-color: #442222; }"
+        )
+        self._cancel_btn.setToolTip(
+            "Cancel the running analysis.\n"
+            "The current frame batch will finish before stopping."
+        )
+        self._cancel_btn.clicked.connect(self._cancel_worker)
+
         toolbar.addWidget(self._phase_label)
         toolbar.addWidget(self._progress)
+        toolbar.addWidget(self._cancel_btn)
         root.addLayout(toolbar)
 
         # ── Toolbar row 2: live filter parameters ──
@@ -1259,14 +1337,35 @@ class MainWindow(QMainWindow):
         )
         self._load_cal_btn.clicked.connect(self._load_cal_dialog)
 
+        self._path_live_chk = QCheckBox("Live path")
+        self._path_live_chk.setChecked(False)
+        self._path_live_chk.setStyleSheet("font-size:11px;")
+        self._path_live_chk.setToolTip(
+            "Live: path grows as the video plays.\n"
+            "Seek anywhere — the map shows only the path up to that moment.\n"
+            "Off: always show the complete session path."
+        )
+
         _path_toggle_row.addWidget(self._path_show_path_chk)
         _path_toggle_row.addWidget(self._path_show_heatmap_chk)
+        _path_toggle_row.addWidget(self._path_live_chk)
         _path_toggle_row.addStretch()
         _path_toggle_row.addWidget(self._path_cal_status_lbl)
         _path_toggle_row.addSpacing(8)
         _path_toggle_row.addWidget(self._save_cal_btn)
         _path_toggle_row.addWidget(self._load_cal_btn)
         _path_tab_layout.addLayout(_path_toggle_row)
+
+        # Stats + export row
+        _path_stats_row = QHBoxLayout()
+        self._path_stats_lbl = QLabel("No path data — run Track Path first.")
+        self._path_stats_lbl.setStyleSheet("font-size:10px; color:#8899aa;")
+        self._export_path_btn = QPushButton("Export Path CSV…")
+        self._export_path_btn.setEnabled(False)
+        self._export_path_btn.clicked.connect(self._export_path_csv)
+        _path_stats_row.addWidget(self._path_stats_lbl, stretch=1)
+        _path_stats_row.addWidget(self._export_path_btn)
+        _path_tab_layout.addLayout(_path_stats_row)
 
         self._path_map = PathMapWidget(room_size_cm=self._room_size_cm)
         _path_tab_layout.addWidget(self._path_map, stretch=1)
@@ -1277,6 +1376,7 @@ class MainWindow(QMainWindow):
         self._path_show_heatmap_chk.stateChanged.connect(
             lambda s: self._path_map.set_show_heatmap(bool(s))
         )
+        self._path_live_chk.stateChanged.connect(self._on_path_live_toggled)
 
         self._tabs.addTab(_path_tab_container, "Path & Heatmap")
 
@@ -1326,6 +1426,8 @@ class MainWindow(QMainWindow):
                 hom_data = load_homography(hom_path)
                 self._homography_matrix = hom_data["matrix"]
                 self._room_size_cm      = tuple(hom_data["room_size_cm"])
+                self._cal_pixel_pts     = hom_data.get("pixel_points", [])
+                self._cal_world_pts     = hom_data.get("world_points_cm", [])
                 self._path_map.set_room_size(*self._room_size_cm)
                 self._path_cal_status_lbl.setText(
                     f"Calibration loaded  ({self._room_size_cm[0]/100:.1f} m × "
@@ -1980,6 +2082,9 @@ class MainWindow(QMainWindow):
 
     def _on_finished(self, raw_frames, action_clips, diagnostic: str):
         self._set_running(False)
+        if diagnostic == "Cancelled":
+            self._status.showMessage("Analysis cancelled.")
+            return
         self._mock_toggle.setChecked(False)
 
         self._raw_frames         = raw_frames
@@ -2007,6 +2112,9 @@ class MainWindow(QMainWindow):
     def _on_mmaction2_finished(self, action_clips, diagnostic: str):
         """Slot for standalone MMAction2 run (no YOLO data involved)."""
         self._set_running(False)
+        if diagnostic == "Cancelled":
+            self._status.showMessage("Analysis cancelled.")
+            return
         self._action_clips = action_clips
 
         n = len(action_clips)
@@ -2052,26 +2160,52 @@ class MainWindow(QMainWindow):
     def _on_path_finished(self, path_pts: list, diagnostic: str):
         """Receive completed path data, build heatmap, update map widget."""
         self._set_running(False)
+        if not path_pts and diagnostic == "Cancelled":
+            self._status.showMessage("Path tracking cancelled.")
+            return
+
         self._path_points = path_pts
 
         # Push trail overlay to video player — (frame_index, cx_px, cy_px)
-        trail = [
-            (p.frame_index, p.cx_px, p.cy_px)
-            for p in path_pts
-        ]
+        trail = [(p.frame_index, p.cx_px, p.cy_px) for p in path_pts]
         self._video.set_trail_points(trail)
 
         # Update top-down map
         self._path_map.set_path(path_pts)
+        if self._path_live_mode:
+            self._path_map.set_time_cutoff(self._last_position_ms)
 
         # Build heatmap if calibrated
-        from backend.path_analyzer import compute_heatmap, heatmap_to_rgba
+        from backend.path_analyzer import (
+            compute_heatmap, heatmap_to_rgba, compute_stats,
+        )
         heatmap_grid = compute_heatmap(path_pts, self._room_size_cm)
         if heatmap_grid.max() > 0:
             rgba = heatmap_to_rgba(heatmap_grid)
             self._path_map.set_heatmap(rgba)
         else:
             self._path_map.set_heatmap(None)
+
+        # Compute and display stats
+        self._path_stats = compute_stats(path_pts)
+        st = self._path_stats
+        if st.calibrated:
+            stats_text = (
+                f"Distance: {st.total_distance_m:.1f} m  ·  "
+                f"Avg speed: {st.avg_speed_m_s:.2f} m/s  ·  "
+                f"Duration: {_fmt_dur(st.duration_s * 1000)}  ·  "
+                f"{st.n_points} pts"
+                + (f"  ({st.n_interpolated} interp.)" if st.n_interpolated else "")
+            )
+        else:
+            stats_text = (
+                f"{st.n_points} track pts  ·  "
+                f"Duration: {_fmt_dur(st.duration_s * 1000)}  ·  "
+                "Calibrate camera for real-world distances"
+            )
+        self._path_stats_lbl.setText(stats_text)
+        self._path_stats_lbl.setStyleSheet("font-size:10px; color:#aabbcc;")
+        self._export_path_btn.setEnabled(len(path_pts) > 0)
 
         n = len(path_pts)
         self._tabs.setTabText(3, f"Path & Heatmap ({n} pts)")
@@ -2308,12 +2442,17 @@ class MainWindow(QMainWindow):
         self._progress.setValue(0)
         self._progress.setVisible(running)
         self._phase_label.setVisible(running)
+        self._cancel_btn.setVisible(running)
+        self._cancel_btn.setEnabled(running)
         if not running:
             self._phase_label.setText("")
 
     # ------------------------------------------------------------------ seek sync
 
     def _on_position_changed(self, position_ms: int):
+        self._last_position_ms = position_ms
+        if self._path_live_mode and self._path_points:
+            self._path_map.set_time_cutoff(position_ms)
         if self._result_time_ranges:
             self._results.highlight_row_at(position_ms, self._result_time_ranges)
         if self._region_time_ranges:
@@ -2340,6 +2479,60 @@ class MainWindow(QMainWindow):
                 self._video.set_seekbar_highlight(start_ms, end_ms)
                 self._hl_tab     = tab
                 self._hl_src_row = src_row
+
+    def _cancel_worker(self):
+        """Request cancellation of the currently running worker."""
+        if self._worker is not None and hasattr(self._worker, "cancel"):
+            self._worker.cancel()
+            self._cancel_btn.setEnabled(False)
+            self._status.showMessage(
+                "Cancelling — finishing current frame batch…"
+            )
+
+    def _export_path_csv(self):
+        """Export the tracked path points to a CSV file."""
+        default_dir = (str(Path(self._video_path).parent)
+                       if self._video_path else "")
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export Path CSV", default_dir,
+            "CSV files (*.csv);;All files (*)"
+        )
+        if not path:
+            return
+        try:
+            import csv as _csv
+            with open(path, "w", newline="", encoding="utf-8") as f:
+                writer = _csv.writer(f)
+                writer.writerow([
+                    "frame_index", "timestamp_ms",
+                    "cx_px", "cy_px",
+                    "x_cm", "y_cm",
+                    "interpolated",
+                ])
+                for p in self._path_points:
+                    writer.writerow([
+                        p.frame_index,
+                        f"{p.timestamp_ms:.1f}",
+                        f"{p.cx_px:.1f}",
+                        f"{p.cy_px:.1f}",
+                        f"{p.x_cm:.1f}" if p.x_cm is not None else "",
+                        f"{p.y_cm:.1f}" if p.y_cm is not None else "",
+                        "1" if p.interpolated else "0",
+                    ])
+            n = len(self._path_points)
+            self._status.showMessage(
+                f"Path exported → {Path(path).name}  ({n} points)"
+            )
+        except Exception as exc:
+            self._status.showMessage(f"Failed to export path: {exc}")
+
+    def _on_path_live_toggled(self, state: int):
+        """Switch path map between live (up-to-playhead) and full-session view."""
+        self._path_live_mode = bool(state)
+        if self._path_live_mode:
+            self._path_map.set_time_cutoff(self._last_position_ms)
+        else:
+            self._path_map.set_time_cutoff(None)
 
     def _clear_seekbar_highlight(self):
         self._hl_tab     = -1

@@ -18,18 +18,279 @@
 
 from pathlib import Path
 
-from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal, QObject
+from PyQt6.QtCore import Qt, QThread, QTimer, QSettings, pyqtSignal, QObject
 from PyQt6.QtGui import QAction
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QPushButton, QLabel, QSplitter, QStatusBar,
     QProgressBar, QCheckBox, QFrame, QSpinBox, QDoubleSpinBox,
     QFileDialog, QInputDialog, QTabWidget, QComboBox, QLineEdit, QMenu,
+    QDialog, QDialogButtonBox, QFormLayout,
+    QListWidget, QListWidgetItem, QScrollArea,
 )
 
 from ui.video_player import VideoPlayerWidget
 from ui.results_table import ResultsTableWidget, GenericTableWidget
 from mock_data import MOCK_BOUNDING_BOXES, MOCK_RESULTS
+
+
+# ---------------------------------------------------------------------------
+# Interaction filter dialog  (non-modal; covers subjects AND object labels)
+# ---------------------------------------------------------------------------
+
+_LIST_STYLE = (
+    "QListWidget { background:#1a1a30; border: 1px solid #2e2e4e; }"
+    "QListWidget::item { color:#dde; padding: 3px; }"
+    "QListWidget::item:alternate { background:#1e1e38; }"
+)
+
+def _make_list_widget() -> "QListWidget":
+    w = QListWidget()
+    w.setAlternatingRowColors(True)
+    w.setStyleSheet(_LIST_STYLE)
+    return w
+
+def _populate_list(
+    lst: "QListWidget",
+    items: list[str],
+    excluded: set[str],
+) -> None:
+    """Fill *lst* with checkable items; items in *excluded* are unchecked."""
+    for label in sorted(items):
+        item = QListWidgetItem(label)
+        item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+        item.setCheckState(
+            Qt.CheckState.Unchecked if label in excluded else Qt.CheckState.Checked
+        )
+        lst.addItem(item)
+    rows = min(lst.count(), 12)
+    lst.setFixedHeight(max(60, rows * 24 + 8))
+
+def _get_excluded(lst: "QListWidget") -> set[str]:
+    return {
+        lst.item(i).text()
+        for i in range(lst.count())
+        if lst.item(i).checkState() == Qt.CheckState.Unchecked
+    }
+
+def _set_excluded_silent(lst: "QListWidget", excluded: set[str]) -> None:
+    lst.itemChanged.disconnect()   # caller re-connects after
+    for i in range(lst.count()):
+        item = lst.item(i)
+        item.setCheckState(
+            Qt.CheckState.Unchecked if item.text() in excluded
+            else Qt.CheckState.Checked
+        )
+
+
+class _InteractionFilterDialog(QDialog):
+    """
+    Non-modal filter window for the Object Interactions tab.
+
+    Top section  — Subject types  (person / hand / foot / …)
+                   Only shows subjects actually detected in the current run.
+    Bottom section — Object labels (ball / table / crayon / …)
+                   One checkbox per unique detected non-subject label.
+
+    Callback on_change(excluded_subjects: set[str], excluded_labels: set[str])
+    is called whenever any checkbox changes.
+    """
+
+    def __init__(
+        self,
+        all_subjects: list[str],
+        all_labels:   list[str],
+        excl_subjects: set[str],
+        excl_labels:   set[str],
+        on_change,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.setWindowTitle("Interaction Filter")
+        self.setWindowFlags(
+            Qt.WindowType.Window | Qt.WindowType.WindowCloseButtonHint
+        )
+        self.setMinimumWidth(300)
+        self._on_change = on_change
+
+        vbox = QVBoxLayout(self)
+        vbox.setSpacing(8)
+
+        # ── Subject section ──
+        subj_lbl = QLabel("Subject types")
+        subj_lbl.setStyleSheet("font-size:11px; font-weight:bold; color:#99ccbb;")
+        vbox.addWidget(subj_lbl)
+
+        hint_s = QLabel(
+            "Person = broad proximity.  Hand/Foot = specific contact.\n"
+            "Subject↔Subject interactions (e.g. person↔hand) are never shown."
+        )
+        hint_s.setStyleSheet("font-size:10px; color:#8899aa;")
+        hint_s.setWordWrap(True)
+        vbox.addWidget(hint_s)
+
+        self._subj_list = _make_list_widget()
+        _populate_list(self._subj_list, all_subjects, excl_subjects)
+        self._subj_list.itemChanged.connect(self._changed)
+        vbox.addWidget(self._subj_list)
+
+        # ── Divider ──
+        line = QFrame()
+        line.setFrameShape(QFrame.Shape.HLine)
+        line.setStyleSheet("color: #2e2e4e;")
+        vbox.addWidget(line)
+
+        # ── Object label section ──
+        obj_lbl = QLabel("Object labels")
+        obj_lbl.setStyleSheet("font-size:11px; font-weight:bold; color:#99aacc;")
+        vbox.addWidget(obj_lbl)
+
+        hint_o = QLabel("Uncheck a label to hide all interactions with that object.")
+        hint_o.setStyleSheet("font-size:10px; color:#8899aa;")
+        hint_o.setWordWrap(True)
+        vbox.addWidget(hint_o)
+
+        self._obj_list = _make_list_widget()
+        _populate_list(self._obj_list, all_labels, excl_labels)
+        self._obj_list.itemChanged.connect(self._changed)
+        vbox.addWidget(self._obj_list)
+
+        btn_row = QHBoxLayout()
+        show_btn = QPushButton("Show All")
+        show_btn.clicked.connect(self._show_all)
+        hide_btn = QPushButton("Hide All Objects")
+        hide_btn.clicked.connect(self._hide_all_objects)
+        btn_row.addWidget(show_btn)
+        btn_row.addWidget(hide_btn)
+        vbox.addLayout(btn_row)
+
+        self.adjustSize()
+
+    # ------------------------------------------------------------------ public
+
+    def populate(
+        self,
+        all_subjects: list[str],
+        all_labels:   list[str],
+        excl_subjects: set[str],
+        excl_labels:   set[str],
+    ):
+        """Rebuild both lists (call after a new YOLO run)."""
+        for lst in (self._subj_list, self._obj_list):
+            lst.itemChanged.disconnect(self._changed)
+            lst.clear()
+        _populate_list(self._subj_list, all_subjects, excl_subjects)
+        _populate_list(self._obj_list,  all_labels,   excl_labels)
+        for lst in (self._subj_list, self._obj_list):
+            lst.itemChanged.connect(self._changed)
+        self.adjustSize()
+
+    def set_excluded_labels(self, excluded: set[str]):
+        """Push updated label exclusions without triggering the callback."""
+        _set_excluded_silent(self._obj_list, excluded)
+        self._obj_list.itemChanged.connect(self._changed)
+
+    def get_excluded_subjects(self) -> set[str]:
+        return _get_excluded(self._subj_list)
+
+    def get_excluded_labels(self) -> set[str]:
+        return _get_excluded(self._obj_list)
+
+    # ------------------------------------------------------------------ private
+
+    def _changed(self, _item=None):
+        self._on_change(self.get_excluded_subjects(), self.get_excluded_labels())
+
+    def _show_all(self):
+        for lst in (self._subj_list, self._obj_list):
+            lst.itemChanged.disconnect(self._changed)
+            for i in range(lst.count()):
+                lst.item(i).setCheckState(Qt.CheckState.Checked)
+            lst.itemChanged.connect(self._changed)
+        self._changed()
+
+    def _hide_all_objects(self):
+        self._obj_list.itemChanged.disconnect(self._changed)
+        for i in range(self._obj_list.count()):
+            self._obj_list.item(i).setCheckState(Qt.CheckState.Unchecked)
+        self._obj_list.itemChanged.connect(self._changed)
+        self._changed()
+
+
+# ---------------------------------------------------------------------------
+# Calibration point dialog  (single popup collects both X and Y)
+# ---------------------------------------------------------------------------
+
+class _CalibPointDialog(QDialog):
+    """
+    Collects the real-world floor coordinates for one calibration click.
+    Shows a single window with two fields (X cm, Y cm) so the user is
+    never confused by back-to-back identical-looking prompts.
+    """
+
+    def __init__(
+        self,
+        step: int,
+        px: float,
+        py: float,
+        room_size_cm: tuple,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.setWindowTitle(f"Calibration — Point {step} / 4")
+        self.setModal(True)
+        self.setMinimumWidth(360)
+
+        vbox = QVBoxLayout(self)
+
+        hint = QLabel(
+            f"<b>Point {step} of 4</b> &nbsp;—&nbsp; pixel ({px:.0f}, {py:.0f})<br><br>"
+            "Enter the real-world floor position for this point.<br><br>"
+            "<b>Coordinate system:</b><br>"
+            "&nbsp; Origin (0, 0) = front-left of room (camera side, left)<br>"
+            "&nbsp; +X = right across the room width<br>"
+            "&nbsp; +Y = toward the far wall<br><br>"
+            f"Room: {room_size_cm[0]:.0f} cm wide &times; "
+            f"{room_size_cm[1]:.0f} cm deep"
+        )
+        hint.setStyleSheet("font-size:11px; color:#aabbcc;")
+        hint.setWordWrap(True)
+        vbox.addWidget(hint)
+
+        form = QFormLayout()
+        form.setSpacing(8)
+        self._x_edit = QLineEdit()
+        self._x_edit.setPlaceholderText("e.g.  0   or   250")
+        self._y_edit = QLineEdit()
+        self._y_edit.setPlaceholderText("e.g.  0   or   600")
+        form.addRow("X  (cm, across width):", self._x_edit)
+        form.addRow("Y  (cm, depth from camera):", self._y_edit)
+        vbox.addLayout(form)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok |
+            QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self._on_accept)
+        buttons.rejected.connect(self.reject)
+        vbox.addWidget(buttons)
+
+        self._result: tuple[float, float] | None = None
+        self._x_edit.setFocus()
+
+    def _on_accept(self):
+        try:
+            x = float(self._x_edit.text().strip())
+            y = float(self._y_edit.text().strip())
+            self._result = (x, y)
+            self.accept()
+        except ValueError:
+            self._x_edit.setStyleSheet("border: 1px solid red;")
+            self._y_edit.setStyleSheet("border: 1px solid red;")
+
+    def result_values(self) -> tuple[float, float] | None:
+        """Returns (x_cm, y_cm) if accepted, else None."""
+        return self._result
 
 
 # ---------------------------------------------------------------------------
@@ -307,6 +568,62 @@ class _MMAction2Worker(QObject):
 
 
 # ---------------------------------------------------------------------------
+# Worker: path tracking (ByteTrack person tracker)
+# ---------------------------------------------------------------------------
+
+class _PathTrackingWorker(QObject):
+    progress = pyqtSignal(int)
+    status   = pyqtSignal(str)
+    finished = pyqtSignal(object, str)   # (list[PathPoint], diagnostic)
+    error    = pyqtSignal(str)
+
+    def __init__(
+        self,
+        video_path: str,
+        yolo_model: str = "yolov8n.pt",
+        homography_matrix = None,        # np.ndarray or None
+        room_size_cm: tuple = (250, 600),
+    ):
+        super().__init__()
+        self._path     = video_path
+        self._model    = yolo_model
+        self._matrix   = homography_matrix
+        self._room     = room_size_cm
+
+    def run(self):
+        try:
+            from backend.tracking_detector import TrackingDetector
+            from backend.path_analyzer     import build_path_points, compute_stats
+
+            self.status.emit("Path tracking — running ByteTrack…")
+            det = TrackingDetector(
+                model_name=self._model,
+                conf_threshold=0.25,
+            )
+            track_pts = det.run(
+                self._path,
+                progress_cb=lambda p: self.progress.emit(p),
+            )
+
+            path_pts = build_path_points(track_pts, self._matrix)
+            stats    = compute_stats(path_pts)
+
+            diag = (
+                f"{len(path_pts)} track points  |  "
+                + (f"distance ≈ {stats.total_distance_m:.1f} m  |  "
+                   f"avg speed ≈ {stats.avg_speed_m_s:.2f} m/s"
+                   if stats.calibrated
+                   else "calibrate camera for real-world distances")
+            )
+            self.progress.emit(100)
+            self.finished.emit(path_pts, diag)
+
+        except Exception as exc:
+            import traceback; traceback.print_exc()
+            self.error.emit(str(exc))
+
+
+# ---------------------------------------------------------------------------
 # Main window
 # ---------------------------------------------------------------------------
 
@@ -327,14 +644,39 @@ class MainWindow(QMainWindow):
         self._action_clips: list = []
         # Named spatial regions
         self._regions: list[dict] = []
-        # YOLO-World custom class list (populated from default or loaded file)
+        # YOLO-World custom class list
         from backend.yolo_classes_config import DEFAULT_PLAYROOM_CLASSES
         self._world_classes: list[str] = list(DEFAULT_PLAYROOM_CLASSES)
+
+        # Interaction filter (Object Interactions tab)
+        self._label_filter_excluded:   set[str] = set()   # excluded object labels
+        self._subject_filter_excluded: set[str] = set()   # excluded subject types
+        self._label_filter_dlg: "_InteractionFilterDialog | None" = None
+
+        # Subject labels: which detected classes are treated as subjects
+        # (always includes "person"; add "hand"/"foot" via YOLO-World bar)
+        self._subject_labels: set[str] = {"person"}
+
+        # Path tracking state
+        self._path_points: list = []          # list[PathPoint]
+        self._homography_matrix = None        # np.ndarray 3×3 or None
+        self._room_size_cm: tuple = (250, 600)
+
+        # Camera calibration state machine
+        # _cal_step = 0 (idle), 1–4 (waiting for click N)
+        self._cal_step: int = 0
+        self._cal_pixel_pts: list = []        # [(px, py), ...]  in pixel coords
+        self._cal_world_pts: list = []        # [(X_cm, Y_cm), ...]
+        self._cal_dialog_active: bool = False # re-entry guard
         # Frame dimensions used by refilter
         self._analysis_fw: int = 0
         self._analysis_fh: int = 0
         # Capture floor recorded in the loaded JSON
         self._capture_conf_floor: float = 0.05
+
+        # Seekbar highlight state (which table row is currently highlighted)
+        self._hl_tab: int = -1          # 0/1/2 = which tab; -1 = none
+        self._hl_src_row: int = -1      # source-model row index
 
         # Debounce timer — refilter fires 250 ms after the last slider change
         self._refilter_timer = QTimer(self)
@@ -344,6 +686,7 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
         self._show_mmaction2_banner()
+        self._load_settings()
 
     # ------------------------------------------------------------------ layout
 
@@ -455,6 +798,22 @@ class MainWindow(QMainWindow):
         )
         self._mmaction2_btn.clicked.connect(self._run_mmaction2)
 
+        self._track_path_btn = QPushButton("Track Path")
+        self._track_path_btn.setEnabled(False)
+        self._track_path_btn.setToolTip(
+            "Run ByteTrack to extract the child's movement path.\n"
+            "Calibrate the camera first for real-world floor coordinates."
+        )
+        self._track_path_btn.clicked.connect(self._run_path_tracking)
+
+        self._calibrate_btn = QPushButton("Calibrate Camera…")
+        self._calibrate_btn.setEnabled(False)
+        self._calibrate_btn.setToolTip(
+            "Click 4 known floor points to set up the perspective transform.\n"
+            "Required for the top-down path map and real-world distances."
+        )
+        self._calibrate_btn.clicked.connect(self._start_calibration)
+
         self._load_json_btn = QPushButton("Load JSON…")
         self._load_json_btn.setToolTip("Load a previously saved _results.json")
         self._load_json_btn.clicked.connect(self._load_json_dialog)
@@ -476,6 +835,8 @@ class MainWindow(QMainWindow):
         toolbar.addWidget(self._yolo_btn)
         toolbar.addWidget(self._full_btn)
         toolbar.addWidget(self._mmaction2_btn)
+        toolbar.addWidget(self._track_path_btn)
+        toolbar.addWidget(self._calibrate_btn)
         toolbar.addWidget(self._load_json_btn)
         toolbar.addWidget(self._phase_label)
         toolbar.addWidget(self._progress)
@@ -572,6 +933,17 @@ class MainWindow(QMainWindow):
             lambda s: self._video.set_mmaction2_visible(bool(s))
         )
 
+        self._trail_vis_chk = QCheckBox("Trail")
+        self._trail_vis_chk.setChecked(True)
+        self._trail_vis_chk.setStyleSheet("font-size:11px;")
+        self._trail_vis_chk.setToolTip(
+            "Show/hide the movement trail overlay on the video.\n"
+            "Trail length: last 5 seconds (blue→red gradient)."
+        )
+        self._trail_vis_chk.stateChanged.connect(
+            lambda s: self._video.set_trail_visible(bool(s))
+        )
+
         parambar.addWidget(self._all_classes_chk)
         parambar.addSpacing(8)
         parambar.addWidget(_param_label("Sample every"))
@@ -594,6 +966,7 @@ class MainWindow(QMainWindow):
         parambar.addSpacing(12)
         parambar.addWidget(self._yolo_vis_chk)
         parambar.addWidget(self._action_vis_chk)
+        parambar.addWidget(self._trail_vis_chk)
         parambar.addStretch()
         root.addWidget(parambar_frame)
 
@@ -684,8 +1057,27 @@ class MainWindow(QMainWindow):
         self._load_classes_btn = QPushButton("Load Classes…")
         self._load_classes_btn.clicked.connect(self._load_classes_dialog)
 
+        subj_lbl = QLabel("Subject classes:")
+        subj_lbl.setStyleSheet("font-size:11px; color:#bbcc88;")
+
+        self._subject_classes_edit = QLineEdit()
+        self._subject_classes_edit.setPlaceholderText(
+            "e.g.  hand, foot  (always includes person)"
+        )
+        self._subject_classes_edit.setToolTip(
+            "Comma-separated YOLO-World labels to treat as SUBJECTS.\n"
+            "Subjects interact WITH objects — subject↔subject pairs are ignored.\n"
+            "'person' is always a subject.  Add 'hand', 'foot' here if detected.\n"
+            "These labels are also automatically added to the detection class list."
+        )
+        self._subject_classes_edit.setFixedWidth(260)
+        self._subject_classes_edit.textChanged.connect(self._on_subject_classes_changed)
+
         world_layout.addWidget(world_lbl)
         world_layout.addWidget(self._world_classes_edit, stretch=1)
+        world_layout.addSpacing(16)
+        world_layout.addWidget(subj_lbl)
+        world_layout.addWidget(self._subject_classes_edit)
         world_layout.addWidget(self._save_classes_btn)
         world_layout.addWidget(self._load_classes_btn)
         self._world_frame.setVisible(False)   # hidden until YOLO-World selected
@@ -773,6 +1165,7 @@ class MainWindow(QMainWindow):
         self._video.position_changed.connect(self._on_position_changed)
         self._video.video_loaded.connect(self._on_video_loaded)
         self._video.region_drawn.connect(self._on_region_drawn)
+        self._video.calibration_click.connect(self._on_calibration_click)
 
         # ── Three-tab results panel ──
         self._tabs = QTabWidget()
@@ -791,12 +1184,22 @@ class MainWindow(QMainWindow):
 
         # Tab 0 — YOLO Object Interactions (existing schema)
         self._results = ResultsTableWidget()
+        self._results.filter_btn_clicked.connect(self._open_label_filter)
+        self._results.hide_label_requested.connect(self._hide_label)
+        self._results._table.clicked.connect(
+            lambda idx: self._on_table_row_clicked(idx, 0,
+                self._results._proxy, self._result_time_ranges)
+        )
         self._tabs.addTab(self._results, "Object Interactions")
 
         # Tab 1 — Region Presence
         self._region_table = GenericTableWidget(
             ["Start", "End", "Duration", "Region", "Frames"],
             stretch_col=3,
+        )
+        self._region_table._table.clicked.connect(
+            lambda idx: self._on_table_row_clicked(idx, 1,
+                self._region_table._proxy, self._region_time_ranges)
         )
         self._tabs.addTab(self._region_table, "Regions")
 
@@ -805,7 +1208,77 @@ class MainWindow(QMainWindow):
             ["Start", "End", "Duration", "Action", "Confidence", "Model"],
             stretch_col=3,
         )
+        self._action_table._table.clicked.connect(
+            lambda idx: self._on_table_row_clicked(idx, 2,
+                self._action_table._proxy, self._action_time_ranges)
+        )
         self._tabs.addTab(self._action_table, "Actions (MMAction2)")
+
+        # Tab 3 — Path & Heatmap
+        from ui.path_map_widget import PathMapWidget
+        _path_tab_container = QWidget()
+        _path_tab_layout    = QVBoxLayout(_path_tab_container)
+        _path_tab_layout.setContentsMargins(4, 4, 4, 4)
+        _path_tab_layout.setSpacing(4)
+
+        # Toggle row for path tab layers
+        _path_toggle_row = QHBoxLayout()
+        _path_toggle_row.setSpacing(8)
+
+        self._path_show_path_chk = QCheckBox("Path line")
+        self._path_show_path_chk.setChecked(True)
+        self._path_show_path_chk.setStyleSheet("font-size:11px;")
+        self._path_show_path_chk.setToolTip(
+            "Show/hide the movement path polyline.\n"
+            "Blue = early, Red = late.  Dotted = interpolated."
+        )
+
+        self._path_show_heatmap_chk = QCheckBox("Heatmap")
+        self._path_show_heatmap_chk.setChecked(True)
+        self._path_show_heatmap_chk.setStyleSheet("font-size:11px;")
+        self._path_show_heatmap_chk.setToolTip(
+            "Show/hide the density heatmap overlay.\n"
+            "Blue = low density, Red = high density."
+        )
+
+        self._path_cal_status_lbl = QLabel("No calibration")
+        self._path_cal_status_lbl.setStyleSheet("font-size:10px; color:#8899aa;")
+
+        self._save_cal_btn = QPushButton("Save Cal…")
+        self._save_cal_btn.setFixedWidth(90)
+        self._save_cal_btn.setToolTip(
+            "Save the current homography calibration to a chosen file.\n"
+            "Useful when you have multiple cameras or room setups."
+        )
+        self._save_cal_btn.clicked.connect(self._save_cal_dialog)
+
+        self._load_cal_btn = QPushButton("Load Cal…")
+        self._load_cal_btn.setFixedWidth(90)
+        self._load_cal_btn.setToolTip(
+            "Load a homography calibration file from any location."
+        )
+        self._load_cal_btn.clicked.connect(self._load_cal_dialog)
+
+        _path_toggle_row.addWidget(self._path_show_path_chk)
+        _path_toggle_row.addWidget(self._path_show_heatmap_chk)
+        _path_toggle_row.addStretch()
+        _path_toggle_row.addWidget(self._path_cal_status_lbl)
+        _path_toggle_row.addSpacing(8)
+        _path_toggle_row.addWidget(self._save_cal_btn)
+        _path_toggle_row.addWidget(self._load_cal_btn)
+        _path_tab_layout.addLayout(_path_toggle_row)
+
+        self._path_map = PathMapWidget(room_size_cm=self._room_size_cm)
+        _path_tab_layout.addWidget(self._path_map, stretch=1)
+
+        self._path_show_path_chk.stateChanged.connect(
+            lambda s: self._path_map.set_show_path(bool(s))
+        )
+        self._path_show_heatmap_chk.stateChanged.connect(
+            lambda s: self._path_map.set_show_heatmap(bool(s))
+        )
+
+        self._tabs.addTab(_path_tab_container, "Path & Heatmap")
 
         splitter.addWidget(self._video)
         splitter.addWidget(self._tabs)
@@ -838,8 +1311,33 @@ class MainWindow(QMainWindow):
         self._yolo_btn.setEnabled(True)
         self._full_btn.setEnabled(True)
         self._mmaction2_btn.setEnabled(True)
+        self._track_path_btn.setEnabled(True)
+        self._calibrate_btn.setEnabled(True)
         self._edit_regions_btn.setEnabled(True)
         self._load_regions_btn.setEnabled(True)
+
+        # Auto-load homography if it exists beside the video
+        from backend.homography_config import (
+            default_homography_path, load_homography,
+        )
+        hom_path = default_homography_path(path)
+        if hom_path.exists():
+            try:
+                hom_data = load_homography(hom_path)
+                self._homography_matrix = hom_data["matrix"]
+                self._room_size_cm      = tuple(hom_data["room_size_cm"])
+                self._path_map.set_room_size(*self._room_size_cm)
+                self._path_cal_status_lbl.setText(
+                    f"Calibration loaded  ({self._room_size_cm[0]/100:.1f} m × "
+                    f"{self._room_size_cm[1]/100:.1f} m)"
+                )
+                self._path_cal_status_lbl.setStyleSheet(
+                    "font-size:10px; color:#88cc88;"
+                )
+            except Exception as exc:
+                self._status.showMessage(
+                    f"Warning: could not load homography: {exc}"
+                )
 
         # Auto-load results JSON if it exists beside the video
         from backend.results_format import default_output_path
@@ -927,6 +1425,11 @@ class MainWindow(QMainWindow):
             c.strip() for c in text.split(",") if c.strip()
         ]
 
+    def _on_subject_classes_changed(self, text: str):
+        """Parse the subject classes field; always include 'person'."""
+        extra = {c.strip().lower() for c in text.split(",") if c.strip()}
+        self._subject_labels = {"person"} | extra
+
     def _get_yolo_model_name(self) -> str:
         """Return the actual model filename for the currently selected YOLO model."""
         from backend.yolo_detector import YOLO_MODEL_OPTIONS
@@ -953,10 +1456,17 @@ class MainWindow(QMainWindow):
             return
         try:
             from backend.yolo_classes_config import save_class_list
-            save_class_list(path, config_name.strip(), self._world_classes)
+            # Save subject classes too (exclude "person" — always implicit — but
+            # include everything else the user typed in the Subject classes field)
+            extra_subjects = sorted(self._subject_labels - {"person"})
+            save_class_list(
+                path, config_name.strip(), self._world_classes,
+                subject_classes=extra_subjects if extra_subjects else None,
+            )
             self._status.showMessage(
                 f"Class list saved → {Path(path).name}  "
-                f"({len(self._world_classes)} classes)"
+                f"({len(self._world_classes)} classes, "
+                f"{len(extra_subjects)} extra subject(s))"
             )
         except Exception as exc:
             self._status.showMessage(f"Failed to save class list: {exc}")
@@ -972,15 +1482,101 @@ class MainWindow(QMainWindow):
             return
         try:
             from backend.yolo_classes_config import load_class_list
-            config_name, classes = load_class_list(path)
+            config_name, classes, subject_classes = load_class_list(path)
             self._world_classes = classes
             self._world_classes_edit.setText(", ".join(classes))
-            self._status.showMessage(
+            # Restore subject classes if the file has them
+            if subject_classes:
+                self._subject_classes_edit.setText(", ".join(subject_classes))
+                # _on_subject_classes_changed fires via textChanged signal
+            msg = (
                 f"Class list loaded: '{config_name}'  "
-                f"({len(classes)} class{'es' if len(classes) != 1 else ''})"
+                f"({len(classes)} class{'es' if len(classes) != 1 else ''}"
             )
+            if subject_classes:
+                msg += f", subjects: {', '.join(subject_classes)}"
+            msg += ")"
+            self._status.showMessage(msg)
         except Exception as exc:
             self._status.showMessage(f"Failed to load class list: {exc}")
+
+    # ------------------------------------------------------------------ region editing
+
+    # ------------------------------------------------------------------ label filter
+
+    def _get_all_object_labels(self) -> list[str]:
+        """All unique non-subject detected labels from the current YOLO run."""
+        if not self._raw_frames:
+            return []
+        return sorted({
+            d.label
+            for fd in self._raw_frames
+            for d in fd.detections
+            if d.label not in self._subject_labels
+        })
+
+    def _get_detected_subjects(self) -> list[str]:
+        """Subject labels that were actually detected in the current run."""
+        if not self._raw_frames:
+            return ["person"]
+        detected = {
+            d.label
+            for fd in self._raw_frames
+            for d in fd.detections
+            if d.label in self._subject_labels
+        }
+        # Always include "person" even if not detected (so it shows in dialog)
+        detected.add("person")
+        return sorted(detected)
+
+    def _open_label_filter(self):
+        """Open (or bring to front) the non-modal interaction filter dialog."""
+        all_labels   = self._get_all_object_labels()
+        all_subjects = self._get_detected_subjects()
+        if not all_labels and not all_subjects:
+            self._status.showMessage(
+                "No YOLO data loaded yet — run YOLO first."
+            )
+            return
+        if self._label_filter_dlg and self._label_filter_dlg.isVisible():
+            self._label_filter_dlg.populate(
+                all_subjects, all_labels,
+                self._subject_filter_excluded, self._label_filter_excluded,
+            )
+            self._label_filter_dlg.raise_()
+            self._label_filter_dlg.activateWindow()
+        else:
+            self._label_filter_dlg = _InteractionFilterDialog(
+                all_subjects=all_subjects,
+                all_labels=all_labels,
+                excl_subjects=self._subject_filter_excluded,
+                excl_labels=self._label_filter_excluded,
+                on_change=self._on_interaction_filter_changed,
+                parent=self,
+            )
+            self._label_filter_dlg.show()
+
+    def _on_interaction_filter_changed(
+        self, excl_subjects: set[str], excl_labels: set[str]
+    ):
+        """Called by the dialog whenever any checkbox changes."""
+        self._subject_filter_excluded = excl_subjects
+        self._label_filter_excluded   = excl_labels
+        n_hidden = len(excl_subjects) + len(excl_labels)
+        self._results.set_filter_status(n_hidden)
+        self._schedule_refilter()
+
+    def _hide_label(self, label: str):
+        """Called by the right-click 'Hide' action on a table row."""
+        self._label_filter_excluded.add(label)
+        if self._label_filter_dlg and self._label_filter_dlg.isVisible():
+            self._label_filter_dlg.set_excluded_labels(self._label_filter_excluded)
+            self._label_filter_dlg._obj_list.itemChanged.connect(
+                self._label_filter_dlg._changed
+            )
+        n_hidden = len(self._label_filter_excluded) + len(self._subject_filter_excluded)
+        self._results.set_filter_status(n_hidden)
+        self._schedule_refilter()
 
     # ------------------------------------------------------------------ region editing
 
@@ -1200,13 +1796,28 @@ class MainWindow(QMainWindow):
         filtered = _filter_frames(self._raw_frames, conf)
 
         # ── Tab 0: Object Interactions ──
-        mapped = InteractionMapper(proximity_px=prox).map(filtered)
+        mapped = InteractionMapper(
+            proximity_px=prox,
+            subject_labels=self._subject_labels,
+        ).map(filtered)
         segs, ui_boxes = SegmentBuilder(fw, fh, min_duration_ms=min_dur).build(
             mapped, action_clips=filtered_clips
         )
         self._video.set_frame_detections(_convert_boxes(ui_boxes))
 
-        table_rows = [s.as_table_row() for s in segs]
+        # Apply subject + label exclusion filters before building table rows
+        visible_segs = segs
+        if self._subject_filter_excluded:
+            visible_segs = [
+                s for s in visible_segs
+                if s.subject_label not in self._subject_filter_excluded
+            ]
+        table_rows = [s.as_table_row() for s in visible_segs]
+        if self._label_filter_excluded:
+            table_rows = [
+                r for r in table_rows
+                if r[3] not in self._label_filter_excluded
+            ]
         self._results.set_results(table_rows)
         self._result_time_ranges = [
             (_hms_to_ms(r[0]), _hms_to_ms(r[1])) for r in table_rows
@@ -1229,9 +1840,11 @@ class MainWindow(QMainWindow):
         ]
 
         # ── Update tab labels with row counts ──
-        n      = len(segs)
+        n      = len(table_rows)   # post-filter count
         n_reg  = len(region_segs)
         n_clip = len(filtered_clips)
+        n_hidden = len(self._label_filter_excluded) + len(self._subject_filter_excluded)
+        self._results.set_filter_status(n_hidden)
         self._tabs.setTabText(0, f"Object Interactions ({n})")
         self._tabs.setTabText(1, f"Regions ({n_reg})")
         self._tabs.setTabText(2, f"Actions ({n_clip})")
@@ -1320,7 +1933,18 @@ class MainWindow(QMainWindow):
         display_conf = self._conf_spin.value()
         yolo_model   = self._get_yolo_model_name()
         is_world     = "world" in yolo_model.lower()
-        world_cls    = self._world_classes if is_world else None
+        # Merge subject classes (hand, foot…) into the detection list so they
+        # get detected by YOLO-World even if the user forgot to add them above.
+        if is_world:
+            # YOLO-World needs every label listed explicitly — auto-add all
+            # subject classes (including "person") if not already present.
+            merged_cls = list(dict.fromkeys(
+                self._world_classes + [s for s in self._subject_labels
+                                       if s not in self._world_classes]
+            ))
+            world_cls = merged_cls
+        else:
+            world_cls = None
         mm_models    = self._get_enabled_mmaction2_models()
 
         self._set_running(True)
@@ -1370,6 +1994,14 @@ class MainWindow(QMainWindow):
             f"Run complete  ·  auto-saved → {json_path.name}  ·  refiltering…"
         )
         self._status.showMessage(f"Analysis complete — {diagnostic}")
+        # Refresh the filter dialog if open (new labels/subjects may have appeared)
+        if self._label_filter_dlg and self._label_filter_dlg.isVisible():
+            self._label_filter_dlg.populate(
+                self._get_detected_subjects(),
+                self._get_all_object_labels(),
+                self._subject_filter_excluded,
+                self._label_filter_excluded,
+            )
         self._refilter()
 
     def _on_mmaction2_finished(self, action_clips, diagnostic: str):
@@ -1386,15 +2018,289 @@ class MainWindow(QMainWindow):
         # refilter updates the banner and source label (YOLO part skipped if no raw_frames)
         self._refilter()
 
+    # ------------------------------------------------------------------ path tracking
+
+    def _run_path_tracking(self):
+        """Launch the ByteTrack path-tracking worker."""
+        if not self._video_path:
+            self._status.showMessage("No video loaded.")
+            return
+        if self._worker_thread and self._worker_thread.isRunning():
+            return
+
+        yolo_model = self._get_yolo_model_name()
+        self._set_running(True)
+        self._worker = _PathTrackingWorker(
+            self._video_path,
+            yolo_model=yolo_model,
+            homography_matrix=self._homography_matrix,
+            room_size_cm=self._room_size_cm,
+        )
+        self._worker_thread = QThread()
+        self._worker.moveToThread(self._worker_thread)
+
+        self._worker_thread.started.connect(self._worker.run)
+        self._worker.progress.connect(self._progress.setValue)
+        self._worker.status.connect(self._on_worker_status)
+        self._worker.finished.connect(self._on_path_finished)
+        self._worker.error.connect(self._on_error)
+        self._worker.finished.connect(lambda *_: self._worker_thread.quit())
+        self._worker.error.connect(   lambda *_: self._worker_thread.quit())
+
+        self._worker_thread.start()
+
+    def _on_path_finished(self, path_pts: list, diagnostic: str):
+        """Receive completed path data, build heatmap, update map widget."""
+        self._set_running(False)
+        self._path_points = path_pts
+
+        # Push trail overlay to video player — (frame_index, cx_px, cy_px)
+        trail = [
+            (p.frame_index, p.cx_px, p.cy_px)
+            for p in path_pts
+        ]
+        self._video.set_trail_points(trail)
+
+        # Update top-down map
+        self._path_map.set_path(path_pts)
+
+        # Build heatmap if calibrated
+        from backend.path_analyzer import compute_heatmap, heatmap_to_rgba
+        heatmap_grid = compute_heatmap(path_pts, self._room_size_cm)
+        if heatmap_grid.max() > 0:
+            rgba = heatmap_to_rgba(heatmap_grid)
+            self._path_map.set_heatmap(rgba)
+        else:
+            self._path_map.set_heatmap(None)
+
+        n = len(path_pts)
+        self._tabs.setTabText(3, f"Path & Heatmap ({n} pts)")
+        self._status.showMessage(f"Path tracking complete — {diagnostic}")
+
+    # ------------------------------------------------------------------ camera calibration
+
+    def _start_calibration(self):
+        """
+        Begin 4-point homography calibration.
+        The user must click 4 known floor points in the video frame
+        and type in their real-world X, Y positions in cm.
+        """
+        if not self._video_path:
+            self._status.showMessage("Load a video before calibrating.")
+            return
+
+        # Ask for room dimensions before starting click sequence
+        w_txt, ok = QInputDialog.getText(
+            self, "Room Width",
+            "Room width in cm (across the camera view):",
+            text=str(int(self._room_size_cm[0])),
+        )
+        if not ok or not w_txt.strip():
+            return
+        d_txt, ok = QInputDialog.getText(
+            self, "Room Depth",
+            "Room depth in cm (front-to-far wall, away from camera):",
+            text=str(int(self._room_size_cm[1])),
+        )
+        if not ok or not d_txt.strip():
+            return
+
+        try:
+            new_w = float(w_txt.strip())
+            new_d = float(d_txt.strip())
+        except ValueError:
+            self._status.showMessage("Invalid room dimensions — enter numbers.")
+            return
+
+        self._room_size_cm = (new_w, new_d)
+        self._path_map.set_room_size(new_w, new_d)
+
+        # Reset calibration state
+        self._cal_step      = 1
+        self._cal_pixel_pts = []
+        self._cal_world_pts = []
+        self._video.set_calibration_mode(True)
+        self._video.set_cal_markers([])
+
+        self._status.showMessage(
+            "Calibration: click point 1 / 4 on the video frame."
+        )
+
+    def _on_calibration_click(self, nx: float, ny: float):
+        """
+        Handle each of the 4 calibration clicks.
+        nx, ny are normalised (0–1) video-frame coordinates.
+        A re-entry guard prevents double-firing while the dialog is open.
+        """
+        if self._cal_step == 0 or self._cal_dialog_active:
+            return
+
+        self._cal_dialog_active = True
+        try:
+            self._handle_calibration_click(nx, ny)
+        finally:
+            self._cal_dialog_active = False
+
+    def _handle_calibration_click(self, nx: float, ny: float):
+        """Inner implementation — called from the guarded wrapper above."""
+        step = self._cal_step
+        fw   = self._video.frame_width  or 1
+        fh   = self._video.frame_height or 1
+        px   = nx * fw
+        py   = ny * fh
+
+        dlg = _CalibPointDialog(step, px, py, self._room_size_cm, parent=self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return   # user cancelled — keep the same step
+
+        vals = dlg.result_values()
+        if vals is None:
+            self._status.showMessage(
+                "Invalid coordinates — enter numbers and try again."
+            )
+            return
+
+        x_cm, y_cm = vals
+        self._cal_pixel_pts.append([px, py])
+        self._cal_world_pts.append([x_cm, y_cm])
+
+        # Update crosshair markers on the video
+        self._video.set_cal_markers([
+            (p[0] / fw, p[1] / fh)
+            for p in self._cal_pixel_pts
+        ])
+
+        if step < 4:
+            self._cal_step += 1
+            self._status.showMessage(
+                f"Calibration: click point {self._cal_step} / 4 on the video frame."
+            )
+        else:
+            # All 4 points collected — compute and save
+            self._cal_step = 0
+            self._video.set_calibration_mode(False)
+            self._video.set_cal_markers([])
+            self._finish_calibration(
+                self._cal_pixel_pts,
+                self._cal_world_pts,
+                self._room_size_cm,
+            )
+
+    def _finish_calibration(
+        self,
+        pixel_pts: list,
+        world_pts: list,
+        room_size_cm: tuple,
+        save_path: str | None = None,
+    ):
+        """
+        Compute the homography from 4 point pairs and persist it.
+        save_path: if None, auto-derives the path from the video filename.
+        """
+        try:
+            from backend.homography_config import (
+                save_homography, default_homography_path,
+            )
+            path = (Path(save_path)
+                    if save_path
+                    else default_homography_path(self._video_path))
+            matrix = save_homography(
+                path, pixel_pts, world_pts, list(room_size_cm),
+            )
+            self._homography_matrix = matrix
+            self._room_size_cm      = tuple(room_size_cm)
+            self._path_map.set_room_size(*room_size_cm)
+            self._path_cal_status_lbl.setText(
+                f"Calibrated  ({room_size_cm[0]/100:.1f} m × "
+                f"{room_size_cm[1]/100:.1f} m)"
+            )
+            self._path_cal_status_lbl.setStyleSheet(
+                "font-size:10px; color:#88cc88;"
+            )
+            self._status.showMessage(
+                f"Calibration saved → {path.name}  —  "
+                f"Run 'Track Path' to see the floor map."
+            )
+        except Exception as exc:
+            self._status.showMessage(f"Calibration failed: {exc}")
+            print(f"[Calibration] Error: {exc}")
+
+    # ------------------------------------------------------------------ save/load calibration
+
+    def _save_cal_dialog(self):
+        """Save the current homography to a user-chosen file."""
+        if self._homography_matrix is None:
+            self._status.showMessage(
+                "No calibration to save — run 'Calibrate Camera…' first."
+            )
+            return
+        default_dir = (str(Path(self._video_path).parent)
+                       if self._video_path else "")
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Calibration", default_dir,
+            "Homography (*.homography.json);;JSON (*.json);;All files (*)"
+        )
+        if not path:
+            return
+        if not path.endswith(".json"):
+            path += ".homography.json"
+        try:
+            from backend.homography_config import save_homography
+            save_homography(
+                path,
+                self._cal_pixel_pts,
+                self._cal_world_pts,
+                list(self._room_size_cm),
+            )
+            self._status.showMessage(
+                f"Calibration saved → {Path(path).name}"
+            )
+        except Exception as exc:
+            self._status.showMessage(f"Failed to save calibration: {exc}")
+
+    def _load_cal_dialog(self):
+        """Load a homography file from any location."""
+        default_dir = (str(Path(self._video_path).parent)
+                       if self._video_path else "")
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Load Calibration", default_dir,
+            "Homography (*.homography.json *.json);;All files (*)"
+        )
+        if not path:
+            return
+        try:
+            from backend.homography_config import load_homography
+            data = load_homography(path)
+            self._homography_matrix = data["matrix"]
+            self._room_size_cm      = tuple(data["room_size_cm"])
+            self._cal_pixel_pts     = data["pixel_points"]
+            self._cal_world_pts     = data["world_points_cm"]
+            self._path_map.set_room_size(*self._room_size_cm)
+            self._path_cal_status_lbl.setText(
+                f"Calibration loaded  ({self._room_size_cm[0]/100:.1f} m × "
+                f"{self._room_size_cm[1]/100:.1f} m)"
+            )
+            self._path_cal_status_lbl.setStyleSheet(
+                "font-size:10px; color:#88cc88;"
+            )
+            self._status.showMessage(
+                f"Calibration loaded: {Path(path).name}"
+            )
+        except Exception as exc:
+            self._status.showMessage(f"Failed to load calibration: {exc}")
+
     def _on_error(self, message: str):
         self._set_running(False)
         self._status.showMessage(f"Error: {message}")
         print(f"[Worker] Error: {message}")
 
     def _set_running(self, running: bool):
-        self._yolo_btn.setEnabled(not running and self._video_path is not None)
-        self._full_btn.setEnabled(not running and self._video_path is not None)
-        self._mmaction2_btn.setEnabled(not running and self._video_path is not None)
+        has_video = self._video_path is not None
+        self._yolo_btn.setEnabled(not running and has_video)
+        self._full_btn.setEnabled(not running and has_video)
+        self._mmaction2_btn.setEnabled(not running and has_video)
+        self._track_path_btn.setEnabled(not running and has_video)
+        self._calibrate_btn.setEnabled(not running and has_video)
         self._load_json_btn.setEnabled(not running)
         self._mock_toggle.setEnabled(not running)
         self._sample_spin.setEnabled(not running)
@@ -1414,6 +2320,89 @@ class MainWindow(QMainWindow):
             self._region_table.highlight_row_at(position_ms, self._region_time_ranges)
         if self._action_time_ranges:
             self._action_table.highlight_row_at(position_ms, self._action_time_ranges)
+
+    # ------------------------------------------------------------------ seekbar highlight
+
+    def _on_table_row_clicked(self, proxy_idx, tab: int, proxy, time_ranges: list):
+        """
+        Toggle a seek-bar highlight for the clicked row's time range.
+        Clicking the same row again clears the highlight.
+        """
+        src_row = proxy.mapToSource(proxy_idx).row()
+        if self._hl_tab == tab and self._hl_src_row == src_row:
+            # Same row clicked again → clear
+            self._hl_tab     = -1
+            self._hl_src_row = -1
+            self._video.clear_seekbar_highlight()
+        else:
+            if 0 <= src_row < len(time_ranges):
+                start_ms, end_ms = time_ranges[src_row]
+                self._video.set_seekbar_highlight(start_ms, end_ms)
+                self._hl_tab     = tab
+                self._hl_src_row = src_row
+
+    def _clear_seekbar_highlight(self):
+        self._hl_tab     = -1
+        self._hl_src_row = -1
+        self._video.clear_seekbar_highlight()
+
+    # ------------------------------------------------------------------ settings persistence
+
+    def _settings(self) -> QSettings:
+        return QSettings("PlayroomAnnotator", "PlayroomAnnotator")
+
+    def _load_settings(self):
+        s = self._settings()
+        # Spinboxes / numeric params
+        self._conf_spin.setValue(           float(s.value("yolo_conf",   0.25)))
+        self._mmaction2_conf_spin.setValue( float(s.value("action_conf", 0.50)))
+        self._prox_spin.setValue(           int(  s.value("proximity",   150)))
+        self._min_dur_spin.setValue(        float(s.value("min_dur",     0.2)))
+        self._sample_spin.setValue(         int(  s.value("sample_rate", 1)))
+        # Checkboxes
+        self._all_classes_chk.setChecked( s.value("all_classes",   True,  type=bool))
+        self._yolo_vis_chk.setChecked(    s.value("yolo_vis",      True,  type=bool))
+        self._action_vis_chk.setChecked(  s.value("action_vis",    True,  type=bool))
+        self._trail_vis_chk.setChecked(   s.value("trail_vis",     True,  type=bool))
+        self._debug_toggle.setChecked(    s.value("debug_mode",    False, type=bool))
+        # YOLO model
+        idx = int(s.value("yolo_model_idx", 0))
+        if 0 <= idx < self._yolo_model_combo.count():
+            self._yolo_model_combo.setCurrentIndex(idx)
+        # MMAction2 model checkboxes
+        for act in self._mm_model_actions:
+            key = f"mm_model_{act.data()}"
+            act.setChecked(s.value(key, True, type=bool))
+        # YOLO-World classes
+        world_text = s.value("world_classes_text", "")
+        if world_text:
+            self._world_classes_edit.setText(world_text)
+        # Subject classes
+        subj_text = s.value("subject_classes_text", "")
+        if subj_text:
+            self._subject_classes_edit.setText(subj_text)
+
+    def _save_settings(self):
+        s = self._settings()
+        s.setValue("yolo_conf",           self._conf_spin.value())
+        s.setValue("action_conf",         self._mmaction2_conf_spin.value())
+        s.setValue("proximity",           self._prox_spin.value())
+        s.setValue("min_dur",             self._min_dur_spin.value())
+        s.setValue("sample_rate",         self._sample_spin.value())
+        s.setValue("all_classes",         self._all_classes_chk.isChecked())
+        s.setValue("yolo_vis",            self._yolo_vis_chk.isChecked())
+        s.setValue("action_vis",          self._action_vis_chk.isChecked())
+        s.setValue("trail_vis",           self._trail_vis_chk.isChecked())
+        s.setValue("debug_mode",          self._debug_toggle.isChecked())
+        s.setValue("yolo_model_idx",      self._yolo_model_combo.currentIndex())
+        for act in self._mm_model_actions:
+            s.setValue(f"mm_model_{act.data()}", act.isChecked())
+        s.setValue("world_classes_text",  self._world_classes_edit.text())
+        s.setValue("subject_classes_text",self._subject_classes_edit.text())
+
+    def closeEvent(self, event):
+        self._save_settings()
+        super().closeEvent(event)
 
 
 # ---------------------------------------------------------------------------

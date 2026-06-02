@@ -11,11 +11,11 @@
 #   Full-width stretch on the last column by default.
 
 import csv
-from PyQt6.QtCore import Qt, QSortFilterProxyModel
+from PyQt6.QtCore import Qt, QSortFilterProxyModel, pyqtSignal
 from PyQt6.QtGui import QStandardItemModel, QStandardItem
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
-    QTableView, QLabel, QFileDialog, QHeaderView,
+    QTableView, QLabel, QFileDialog, QHeaderView, QMenu,
 )
 
 ALL_COLUMNS = ["Start Time", "End Time", "Action", "Object",
@@ -24,6 +24,11 @@ DEBUG_COLUMNS = {4, 5}   # column indices that are hidden in normal mode
 
 
 class ResultsTableWidget(QWidget):
+    # Emitted when the user clicks the filter button
+    filter_btn_clicked   = pyqtSignal()
+    # Emitted when the user right-clicks a row and chooses "Hide <label>"
+    hide_label_requested = pyqtSignal(str)
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._rows: list = []
@@ -43,8 +48,16 @@ class ResultsTableWidget(QWidget):
         title.setStyleSheet("font-weight:bold; font-size:13px;")
         self._count_label = QLabel("0 rows")
         self._count_label.setStyleSheet("color:#888; font-size:11px;")
+        self._filter_btn = QPushButton("⚙ Filter")
+        self._filter_btn.setFixedWidth(84)
+        self._filter_btn.setToolTip(
+            "Filter by subject type (person / hand / foot) and object label.\n"
+            "Right-click any row to quickly hide that object label."
+        )
+        self._filter_btn.clicked.connect(self.filter_btn_clicked)
         header_row.addWidget(title)
         header_row.addStretch()
+        header_row.addWidget(self._filter_btn)
         header_row.addWidget(self._count_label)
         root.addLayout(header_row)
 
@@ -69,6 +82,8 @@ class ResultsTableWidget(QWidget):
             "QTableView { gridline-color: #2e2e4e; }"
             "QTableView::item:selected { background: #3a3a6e; }"
         )
+        self._table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._table.customContextMenuRequested.connect(self._on_context_menu)
         root.addWidget(self._table, stretch=1)
 
         # Initially hide debug columns
@@ -125,6 +140,33 @@ class ResultsTableWidget(QWidget):
         self._debug_mode = enabled
         for col in DEBUG_COLUMNS:
             self._table.setColumnHidden(col, not enabled)
+
+    def set_filter_status(self, n_hidden: int):
+        """Update the filter button label to reflect how many items are hidden."""
+        if n_hidden == 0:
+            self._filter_btn.setText("⚙ Filter")
+            self._filter_btn.setStyleSheet("")
+        else:
+            self._filter_btn.setText(f"⚙ Filter  ({n_hidden} hidden)")
+            self._filter_btn.setStyleSheet("color: #ffaa44; font-weight: bold;")
+
+    def _on_context_menu(self, pos):
+        """Right-click on a row → offer to hide that row's object label."""
+        idx = self._table.indexAt(pos)
+        if not idx.isValid():
+            return
+        src_row   = self._proxy.mapToSource(idx).row()
+        obj_label = self._model.item(src_row, 3)   # col 3 = Object
+        if obj_label is None:
+            return
+        label = obj_label.text().strip()
+        if not label or label == "—":
+            return
+        menu       = QMenu(self)
+        hide_act   = menu.addAction(f'Hide  "{label}"')
+        chosen     = menu.exec(self._table.viewport().mapToGlobal(pos))
+        if chosen == hide_act:
+            self.hide_label_requested.emit(label)
 
     def highlight_row_at(self, position_ms: int, time_rows: list):
         for i, (start_ms, end_ms) in enumerate(time_rows):

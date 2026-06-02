@@ -43,24 +43,71 @@ _REGION_COLORS = [
 
 
 # ---------------------------------------------------------------------------
+# _HighlightSlider — QSlider with an optional highlighted time-range band
+# ---------------------------------------------------------------------------
+
+class _HighlightSlider(QSlider):
+    """
+    Horizontal seek slider that can display a coloured band over a time range.
+    The band is rendered via a QSS gradient so it plays nicely with the app
+    stylesheet — no custom paintEvent needed.
+    """
+
+    _BASE_STYLE = (
+        "QSlider::groove:horizontal {"
+        "  height: 4px; background: #2e2e5e; border-radius: 2px; }"
+        "QSlider::handle:horizontal {"
+        "  background: #7070cc; border-radius: 6px;"
+        "  width: 12px; height: 12px; margin: -4px 0; }"
+    )
+
+    def set_highlight(self, start_frac: float, end_frac: float):
+        """
+        Colour the groove between *start_frac* and *end_frac* (both 0.0–1.0).
+        """
+        p1 = round(max(0.0, min(0.9998, start_frac)), 4)
+        p2 = round(max(p1 + 0.0002, min(1.0, end_frac)), 4)
+        # Use tiny offsets so QSS gradient stops don't coincide
+        a = f"{p1:.4f}"
+        b = f"{min(p1 + 0.0001, p2):.4f}"
+        c = f"{max(p2 - 0.0001, p1):.4f}"
+        d = f"{p2:.4f}"
+        self.setStyleSheet(
+            f"QSlider::groove:horizontal {{"
+            f"  height: 4px; border-radius: 2px;"
+            f"  background: qlineargradient(x1:0, y1:0, x2:1, y2:0,"
+            f"    stop:0 #2e2e5e, stop:{a} #2e2e5e,"
+            f"    stop:{b} #40b8ff, stop:{c} #40b8ff,"
+            f"    stop:{d} #2e2e5e, stop:1 #2e2e5e); }}"
+            f"QSlider::handle:horizontal {{"
+            f"  background: #7070cc; border-radius: 6px;"
+            f"  width: 12px; height: 12px; margin: -4px 0; }}"
+        )
+
+    def clear_highlight(self):
+        """Remove any highlight and restore the default groove colour."""
+        self.setStyleSheet("")   # inherits from parent app stylesheet
+
+
+# ---------------------------------------------------------------------------
 # _FrameLabel — QLabel subclass with rubber-band region drawing
 # ---------------------------------------------------------------------------
 
 class _FrameLabel(QLabel):
     """
-    QLabel that captures mouse events to let the user draw named regions.
-    Emits region_drawn(nx, ny, nw, nh) in normalised video coordinates
-    (0–1) when the mouse is released after a drag of at least 5 px.
+    QLabel that intercepts mouse events for two exclusive modes:
 
-    Call set_video_size(w, h) after loading a video so that the coordinate
-    mapping accounts for the KeepAspectRatio letterbox offset correctly.
+    Region edit mode  — rubber-band drag → region_drawn(nx, ny, nw, nh)
+    Calibration mode  — single click    → calibration_click(nx, ny)
     """
-    region_drawn = pyqtSignal(float, float, float, float)
+    region_drawn      = pyqtSignal(float, float, float, float)
+    calibration_click = pyqtSignal(float, float)
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._edit_mode   = False
-        self._press_px: tuple | None = None   # (x, y) in label pixel coords
+        self._edit_mode        = False
+        self._calibration_mode = False
+        self._press_px: tuple | None = None
         self._video_w     = 0
         self._video_h     = 0
         self._rubber_band = QRubberBand(QRubberBand.Shape.Rectangle, self)
@@ -77,6 +124,13 @@ class _FrameLabel(QLabel):
             if enabled else Qt.CursorShape.ArrowCursor
         )
 
+    def set_calibration_mode(self, enabled: bool):
+        self._calibration_mode = enabled
+        if enabled:
+            self.setCursor(Qt.CursorShape.CrossCursor)
+        elif not self._edit_mode:
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+
     def set_video_size(self, w: int, h: int):
         self._video_w = w
         self._video_h = h
@@ -84,12 +138,13 @@ class _FrameLabel(QLabel):
     # ---------------------------------------------------------------- mouse events
 
     def mousePressEvent(self, event):
-        if self._edit_mode and event.button() == Qt.MouseButton.LeftButton:
+        if event.button() == Qt.MouseButton.LeftButton:
             self._press_px = (event.position().x(), event.position().y())
-            self._rubber_band.setGeometry(
-                QRect(int(self._press_px[0]), int(self._press_px[1]), 0, 0)
-            )
-            self._rubber_band.show()
+            if self._edit_mode:
+                self._rubber_band.setGeometry(
+                    QRect(int(self._press_px[0]), int(self._press_px[1]), 0, 0)
+                )
+                self._rubber_band.show()
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
@@ -105,32 +160,31 @@ class _FrameLabel(QLabel):
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
-        if (self._edit_mode and self._press_px is not None
+        if (self._press_px is not None
                 and event.button() == Qt.MouseButton.LeftButton):
-            self._rubber_band.hide()
             x0, y0 = self._press_px
             x1 = event.position().x()
             y1 = event.position().y()
             self._press_px = None
-
-            # Ignore tiny accidental clicks (< 5 px in either dimension)
-            if abs(x1 - x0) < 5 or abs(y1 - y0) < 5:
-                super().mouseReleaseEvent(event)
-                return
+            is_click = abs(x1 - x0) < 8 and abs(y1 - y0) < 8
 
             ox, oy, sw, sh = self._video_rect()
-            if sw == 0 or sh == 0:
-                super().mouseReleaseEvent(event)
-                return
 
-            # Clamp to video area, convert to normalised coords
-            nx = max(0.0, min(1.0, (min(x0, x1) - ox) / sw))
-            ny = max(0.0, min(1.0, (min(y0, y1) - oy) / sh))
-            nw = max(0.0, min(1.0 - nx, abs(x1 - x0) / sw))
-            nh = max(0.0, min(1.0 - ny, abs(y1 - y0) / sh))
+            if self._calibration_mode and is_click and sw > 0:
+                # Single click in calibration mode → emit normalised position
+                nx = max(0.0, min(1.0, (x1 - ox) / sw))
+                ny = max(0.0, min(1.0, (y1 - oy) / sh))
+                self.calibration_click.emit(nx, ny)
 
-            if nw > 0.01 and nh > 0.01:
-                self.region_drawn.emit(nx, ny, nw, nh)
+            elif self._edit_mode:
+                self._rubber_band.hide()
+                if not is_click and sw > 0:
+                    nx = max(0.0, min(1.0, (min(x0, x1) - ox) / sw))
+                    ny = max(0.0, min(1.0, (min(y0, y1) - oy) / sh))
+                    nw = max(0.0, min(1.0 - nx, abs(x1 - x0) / sw))
+                    nh = max(0.0, min(1.0 - ny, abs(y1 - y0) / sh))
+                    if nw > 0.01 and nh > 0.01:
+                        self.region_drawn.emit(nx, ny, nw, nh)
 
         super().mouseReleaseEvent(event)
 
@@ -158,10 +212,10 @@ class _FrameLabel(QLabel):
 # ---------------------------------------------------------------------------
 
 class VideoPlayerWidget(QWidget):
-    position_changed = pyqtSignal(int)   # current position in ms
-    video_loaded     = pyqtSignal(str)   # path of newly loaded video
-    # Forwarded from _frame_label; caller should prompt for region name
-    region_drawn     = pyqtSignal(float, float, float, float)   # nx, ny, nw, nh
+    position_changed   = pyqtSignal(int)   # current position in ms
+    video_loaded       = pyqtSignal(str)   # path of newly loaded video
+    region_drawn       = pyqtSignal(float, float, float, float)   # nx, ny, nw, nh
+    calibration_click  = pyqtSignal(float, float)                  # nx, ny
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -187,15 +241,23 @@ class VideoPlayerWidget(QWidget):
         self._action_clips: list[dict] = []
 
         # Named spatial regions (normalised coords)
-        # Each entry: {"name": str, "nx": float, "ny": float,
-        #              "nw": float, "nh": float}
         self._regions: list[dict] = []
         self._region_edit_mode: bool = False
+
+        # Path trail overlay — pixel-space track history
+        # Format: [(frame_index, cx_px, cy_px), ...]  sorted by frame_index
+        self._trail_points: list[tuple[int, float, float]] = []
+        self._trail_length_s: float = 5.0    # seconds of history to show
+
+        # Calibration-point overlays (drawn while user is clicking points)
+        # Format: [(nx, ny), ...]  up to 4 points
+        self._cal_markers: list[tuple[float, float]] = []
 
         # Visibility toggles
         self._show_yolo:      bool = True
         self._show_mmaction2: bool = True
         self._show_regions:   bool = True
+        self._show_trail:     bool = True
 
         self._build_ui()
         self._timer = QTimer(self)
@@ -215,11 +277,11 @@ class VideoPlayerWidget(QWidget):
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
         )
         self._frame_label.setMinimumSize(480, 320)
-        # Forward rubber-band draws upward to MainWindow
         self._frame_label.region_drawn.connect(self.region_drawn)
+        self._frame_label.calibration_click.connect(self.calibration_click)
         root.addWidget(self._frame_label, stretch=1)
 
-        self._seek = QSlider(Qt.Orientation.Horizontal)
+        self._seek = _HighlightSlider(Qt.Orientation.Horizontal)
         self._seek.setRange(0, 0)
         self._seek.sliderMoved.connect(self._seek_to)
         root.addWidget(self._seek)
@@ -324,6 +386,53 @@ class VideoPlayerWidget(QWidget):
         self._show_regions = visible
         self._render_frame(self._current_frame)
 
+    # ------------------------------------------------------------------ trail overlay API
+
+    def set_trail_points(self, points: list[tuple[int, float, float]]):
+        """
+        Set path trail data.  points: [(frame_index, cx_px, cy_px), ...]
+        Must be sorted by frame_index.
+        """
+        self._trail_points = points
+        self._render_frame(self._current_frame)
+
+    def set_trail_visible(self, visible: bool):
+        self._show_trail = visible
+        self._render_frame(self._current_frame)
+
+    def set_trail_length(self, seconds: float):
+        self._trail_length_s = max(0.5, seconds)
+        self._render_frame(self._current_frame)
+
+    # ------------------------------------------------------------------ seekbar highlight API
+
+    def set_seekbar_highlight(self, start_ms: float, end_ms: float):
+        """Colour the seek-bar groove between *start_ms* and *end_ms*."""
+        if self._total_frames <= 0 or self._fps <= 0:
+            return
+        total_ms = self._total_frames / self._fps * 1000.0
+        if total_ms <= 0:
+            return
+        self._seek.set_highlight(start_ms / total_ms, end_ms / total_ms)
+
+    def clear_seekbar_highlight(self):
+        """Remove any seek-bar highlight."""
+        self._seek.clear_highlight()
+
+    # ------------------------------------------------------------------ calibration overlay API
+
+    def set_calibration_mode(self, enabled: bool):
+        """Enter/leave calibration click mode (crosshair cursor, no rubber band)."""
+        self._frame_label.set_calibration_mode(enabled)
+
+    def set_cal_markers(self, markers: list[tuple[float, float]]):
+        """
+        Display numbered calibration point markers on the video.
+        markers: [(nx, ny), ...]  up to 4 points in normalised coords.
+        """
+        self._cal_markers = list(markers)
+        self._render_frame(self._current_frame)
+
     def clear_detections(self):
         self._frame_detections = {}
         self._sorted_sample_frames = []
@@ -414,6 +523,56 @@ class VideoPlayerWidget(QWidget):
         pixmap = QPixmap.fromImage(qimg)
 
         painter = QPainter(pixmap)
+
+        # ── Path trail overlay (pixel-space, no homography needed) ──
+        if self._show_trail and self._trail_points:
+            current_ms  = frame_index / self._fps * 1000.0
+            cutoff_ms   = current_ms - self._trail_length_s * 1000.0
+            trail_now   = [
+                (fi, cx, cy) for fi, cx, cy in self._trail_points
+                if fi / self._fps * 1000.0 >= cutoff_ms
+                and fi / self._fps * 1000.0 <= current_ms
+            ]
+            if len(trail_now) >= 2:
+                n = len(trail_now)
+                for i in range(1, n):
+                    t     = i / max(n - 1, 1)
+                    alpha = int(80 + t * 175)   # fade older segments
+                    r     = int(t * 220)
+                    b_    = int((1 - t) * 220)
+                    pen   = QPen(QColor(r, 60, b_, alpha), 3)
+                    painter.setPen(pen)
+                    x0 = int(trail_now[i - 1][1])
+                    y0 = int(trail_now[i - 1][2])
+                    x1_ = int(trail_now[i][1])
+                    y1_ = int(trail_now[i][2])
+                    painter.drawLine(x0, y0, x1_, y1_)
+            # Latest position dot
+            if trail_now:
+                cx_now = int(trail_now[-1][1])
+                cy_now = int(trail_now[-1][2])
+                painter.setPen(QPen(QColor(255, 220, 80), 1))
+                painter.setBrush(QColor(255, 220, 80, 200))
+                painter.drawEllipse(cx_now - 5, cy_now - 5, 10, 10)
+                painter.setBrush(Qt.BrushStyle.NoBrush)  # reset — don't tint later draws
+
+        # ── Calibration point markers ──
+        if self._cal_markers:
+            for idx, (mnx, mny) in enumerate(self._cal_markers):
+                mx = int(mnx * w)
+                my = int(mny * h)
+                # Crosshair
+                painter.setPen(QPen(QColor(255, 200, 0), 2))
+                painter.drawLine(mx - 12, my, mx + 12, my)
+                painter.drawLine(mx, my - 12, mx, my + 12)
+                # Numbered circle
+                painter.setBrush(QColor(255, 200, 0, 200))
+                painter.setPen(QPen(Qt.GlobalColor.black, 1))
+                painter.drawEllipse(mx - 9, my - 9, 18, 18)
+                painter.setPen(QPen(Qt.GlobalColor.black))
+                painter.setFont(QFont("Arial", 8, QFont.Weight.Bold))
+                painter.drawText(mx - 4, my + 4, str(idx + 1))
+            painter.setBrush(Qt.BrushStyle.NoBrush)  # reset after markers
 
         # ── Named region overlays ──
         if self._show_regions and self._regions:

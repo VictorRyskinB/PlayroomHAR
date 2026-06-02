@@ -67,19 +67,25 @@ def save_class_list(
     path: str | Path,
     config_name: str,
     classes: list[str],
+    subject_classes: list[str] | None = None,
 ) -> None:
     """Write a class-list config to *path* (overwrites if exists)."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    data: dict = {"config_name": config_name, "classes": classes}
+    if subject_classes:
+        data["subject_classes"] = subject_classes
     with open(path, "w", encoding="utf-8") as f:
-        json.dump({"config_name": config_name, "classes": classes},
-                  f, indent=2)
+        json.dump(data, f, indent=2)
 
 
-def load_class_list(path: str | Path) -> tuple[str, list[str]]:
+def load_class_list(
+    path: str | Path,
+) -> tuple[str, list[str], list[str]]:
     """
     Load a class-list config.
-    Returns (config_name, classes).
+    Returns (config_name, classes, subject_classes).
+    subject_classes is [] for files saved before this field was added.
     Raises ValueError if the file is malformed.
     """
     with open(path, "r", encoding="utf-8") as f:
@@ -87,4 +93,9 @@ def load_class_list(path: str | Path) -> tuple[str, list[str]]:
     if "classes" not in data:
         raise ValueError(f"No 'classes' key in {path}")
     classes = [str(c).strip() for c in data["classes"] if str(c).strip()]
-    return data.get("config_name", Path(path).stem), classes
+    subject_classes = [
+        str(c).strip()
+        for c in data.get("subject_classes", [])
+        if str(c).strip()
+    ]
+    return data.get("config_name", Path(path).stem), classes, subject_classes

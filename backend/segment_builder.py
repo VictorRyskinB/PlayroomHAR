@@ -2,9 +2,17 @@
 # Converts per-frame interaction data into time-stamped segments and
 # into the normalized bounding-box format consumed by VideoPlayerWidget.
 #
-# The build() method optionally accepts MMAction2 action clips; when
-# provided, apply_action_labels() overlays specific action verbs onto
-# the generic YOLO-derived "Interacting with X" labels.
+# Subject/Object model
+# ─────────────────────────────────────────────────────────────────────────────
+# Each Segment now carries a subject_label ("person", "hand", "foot", …).
+# The segment key used for merging is (subject_label, object_label), so
+# "hand × ball" and "person × ball" produce separate, independently
+# mergeable segments.
+#
+# Table display (as_table_row, col 2 — Action):
+#   person:   "Interacting with ball"   (unchanged, person is implied)
+#   hand:     "[hand] touching ball"
+#   foot:     "[foot] near ball"
 
 from __future__ import annotations
 from dataclasses import dataclass, field
@@ -15,11 +23,8 @@ from backend.interaction_mapper import MappedFrame, InteractionKind
 # Configurable constants
 # ---------------------------------------------------------------------------
 
-MIN_SEGMENT_DURATION_MS = 200    # ignore interactions shorter than this
-                                 # (lowered from 500 ms — catches brief contacts)
-SAME_OBJECT_GAP_MS      = 2000   # merge consecutive same-object segments
-                                 # if the gap between them is ≤ this value
-                                 # (raised from 1000 ms — joins near-miss runs)
+MIN_SEGMENT_DURATION_MS = 200
+SAME_OBJECT_GAP_MS      = 2000
 
 # ---------------------------------------------------------------------------
 # Data types
@@ -27,14 +32,15 @@ SAME_OBJECT_GAP_MS      = 2000   # merge consecutive same-object segments
 
 @dataclass
 class Segment:
-    """One child-object interaction segment."""
-    start_ms: float
-    end_ms: float
-    object_label: str
-    interaction_type: str  = "Interacting with"  # overwritten by MMAction2
-    yolo_confidence: float = 0.0   # average YOLO detection confidence
-    action_confidence: float = 0.0 # MMAction2 confidence (0 when not used)
-    action_source: str = "yolo_spatial"  # "yolo_spatial" | "mmaction2"
+    """One subject-object interaction segment."""
+    start_ms:          float
+    end_ms:            float
+    object_label:      str
+    subject_label:     str   = "person"          # NEW: which subject interacted
+    interaction_type:  str   = "Interacting with" # overwritten by MMAction2
+    yolo_confidence:   float = 0.0
+    action_confidence: float = 0.0
+    action_source:     str   = "yolo_spatial"
 
     @property
     def duration_ms(self) -> float:
@@ -42,16 +48,26 @@ class Segment:
 
     def as_table_row(self) -> tuple[str, str, str, str, str, str]:
         """
-        Return a 6-tuple for the results table:
-          (start, end, action, object, yolo_conf, action_conf)
-        The last two columns are shown only in debug mode.
+        6-tuple: (start, end, action, object, yolo_conf, action_conf).
+        Action column includes subject prefix for non-person subjects.
+        Object column is always the plain object label (for filtering).
         """
-        yolo_str   = f"{self.yolo_confidence:.2f}"   if self.yolo_confidence > 0 else "—"
+        yolo_str   = f"{self.yolo_confidence:.2f}"   if self.yolo_confidence   > 0 else "—"
         action_str = f"{self.action_confidence:.2f}" if self.action_confidence > 0 else "—"
+
+        if self.subject_label == "person":
+            action_col = f"{self.interaction_type} {self.object_label}"
+        else:
+            action_col = (
+                f"[{self.subject_label}] "
+                f"{self.interaction_type.lower()} "
+                f"{self.object_label}"
+            )
+
         return (
             _ms_to_hms(self.start_ms),
             _ms_to_hms(self.end_ms),
-            f"{self.interaction_type} {self.object_label}",
+            action_col,
             self.object_label,
             yolo_str,
             action_str,
@@ -60,17 +76,12 @@ class Segment:
 
 @dataclass
 class UiBox:
-    """
-    One bounding-box entry for VideoPlayerWidget.
-    Coordinates normalized [0.0, 1.0] relative to frame dimensions.
-    """
+    """One bounding-box entry for VideoPlayerWidget (normalised coords)."""
     frame_index: int
-    label: str
-    color: tuple[int, int, int]
-    nx: float
-    ny: float
-    nw: float
-    nh: float
+    label:       str
+    color:       tuple[int, int, int]
+    nx: float;  ny: float
+    nw: float;  nh: float
 
 
 # ---------------------------------------------------------------------------
@@ -78,30 +89,16 @@ class UiBox:
 # ---------------------------------------------------------------------------
 
 class SegmentBuilder:
-    """
-    Converts MappedFrame objects into:
-      - list[Segment]             — for the results table
-      - dict[int, list[UiBox]]    — for the video overlay
-
-    Usage (YOLO-only):
-        builder = SegmentBuilder(frame_w=1280, frame_h=720)
-        segments, ui_boxes = builder.build(mapped_frames)
-
-    Usage (YOLO + MMAction2):
-        from backend.action_recognizer import apply_action_labels
-        segments, ui_boxes = builder.build(mapped_frames, action_clips=clips)
-    """
-
-    COLOR_CHILD       = (255, 130,  50)   # orange — child
-    COLOR_INTERACTING = ( 60, 220,  90)   # green  — interacting object
-    COLOR_PASSIVE     = ( 80, 160, 255)   # blue   — passive object
+    COLOR_CHILD       = (255, 130,  50)   # orange  — subject (person/hand/foot)
+    COLOR_INTERACTING = ( 60, 220,  90)   # green   — interacting object
+    COLOR_PASSIVE     = ( 80, 160, 255)   # blue    — passive object
 
     def __init__(
         self,
         frame_w: int,
         frame_h: int,
         min_duration_ms: float = MIN_SEGMENT_DURATION_MS,
-        merge_gap_ms: float    = SAME_OBJECT_GAP_MS,
+        merge_gap_ms:    float = SAME_OBJECT_GAP_MS,
     ):
         self._fw      = frame_w
         self._fh      = frame_h
@@ -111,22 +108,15 @@ class SegmentBuilder:
     def build(
         self,
         mapped_frames: list[MappedFrame],
-        action_clips: list | None = None,   # list[ActionClip] or None
+        action_clips: list | None = None,
     ) -> tuple[list[Segment], dict[int, list[UiBox]]]:
         ui_boxes = self._build_ui_boxes(mapped_frames)
         raw_segs = self._extract_raw_segments(mapped_frames)
         merged   = self._merge_and_filter(raw_segs)
 
-        # ACTION_OVERRIDE: overlay MMAction2 labels when clips are provided
         if action_clips:
             from backend.action_recognizer import apply_action_labels
             merged = apply_action_labels(merged, action_clips)
-
-        # REGION COUNTING INJECTION POINT:
-        #   Once region-of-interest counts are available from interaction_mapper,
-        #   add a second override pass here:
-        #     from backend.region_mapper import apply_region_context
-        #     merged = apply_region_context(merged, region_data)
 
         return merged, ui_boxes
 
@@ -166,44 +156,50 @@ class SegmentBuilder:
         self, mapped_frames: list[MappedFrame]
     ) -> list[Segment]:
         """
-        Walk frames in order and group consecutive interacting-object runs
-        into Segment instances, accumulating YOLO detection confidence.
+        Walk frames and group consecutive interacting (subject, object) pairs
+        into raw Segment instances.  Key = (subject_label, object_label).
         """
-        # {label: (start_ms, last_ms, [confidence_values])}
-        active: dict[str, tuple[float, float, list[float]]] = {}
+        # {(subj_label, obj_label): (start_ms, last_ms, [conf_values])}
+        active: dict[tuple[str, str], tuple[float, float, list[float]]] = {}
         raw: list[Segment] = []
 
         for mf in mapped_frames:
-            interacting = {
-                md.detection.label: md.detection.confidence
+            # Build dict: {(subj_label, obj_label): conf}
+            interacting: dict[tuple[str, str], float] = {
+                (md.interacting_subject, md.detection.label): md.detection.confidence
                 for md in mf.interacting_objects()
+                if md.interacting_subject   # guard against empty string
             }
 
-            # Close runs for objects no longer interacting
-            for label in set(active) - set(interacting):
-                start_ms, last_ms, confs = active.pop(label)
+            # Close runs for pairs no longer interacting
+            for key in set(active) - set(interacting):
+                subj_lbl, obj_lbl = key
+                start_ms, last_ms, confs = active.pop(key)
                 avg_conf = sum(confs) / len(confs) if confs else 0.0
                 raw.append(Segment(
                     start_ms=start_ms, end_ms=last_ms,
-                    object_label=label,
+                    object_label=obj_lbl,
+                    subject_label=subj_lbl,
                     yolo_confidence=avg_conf,
                 ))
 
-            # Open or extend runs
-            for label, conf in interacting.items():
-                if label not in active:
-                    active[label] = (mf.timestamp_ms, mf.timestamp_ms, [conf])
+            # Open or extend active runs
+            for (subj_lbl, obj_lbl), conf in interacting.items():
+                key = (subj_lbl, obj_lbl)
+                if key not in active:
+                    active[key] = (mf.timestamp_ms, mf.timestamp_ms, [conf])
                 else:
-                    s, _, cs = active[label]
+                    s, _, cs = active[key]
                     cs.append(conf)
-                    active[label] = (s, mf.timestamp_ms, cs)
+                    active[key] = (s, mf.timestamp_ms, cs)
 
         # Close still-open runs at end of video
-        for label, (start_ms, last_ms, confs) in active.items():
+        for (subj_lbl, obj_lbl), (start_ms, last_ms, confs) in active.items():
             avg_conf = sum(confs) / len(confs) if confs else 0.0
             raw.append(Segment(
                 start_ms=start_ms, end_ms=last_ms,
-                object_label=label,
+                object_label=obj_lbl,
+                subject_label=subj_lbl,
                 yolo_confidence=avg_conf,
             ))
 
@@ -211,24 +207,25 @@ class SegmentBuilder:
         return raw
 
     def _merge_and_filter(self, segments: list[Segment]) -> list[Segment]:
-        """Merge nearby same-object segments, then drop too-short ones."""
-        by_label: dict[str, list[Segment]] = {}
+        """Merge nearby same-(subject, object) segments; drop too-short ones."""
+        by_key: dict[tuple[str, str], list[Segment]] = {}
         for s in segments:
-            by_label.setdefault(s.object_label, []).append(s)
+            key = (s.subject_label, s.object_label)
+            by_key.setdefault(key, []).append(s)
 
         merged: list[Segment] = []
-        for label, segs in by_label.items():
+        for (subj_lbl, obj_lbl), segs in by_key.items():
             segs.sort(key=lambda s: s.start_ms)
             cur = segs[0]
             for nxt in segs[1:]:
                 if nxt.start_ms - cur.end_ms <= self._gap:
-                    # Weighted average confidence
-                    d1, d2 = cur.duration_ms, nxt.duration_ms
-                    total = d1 + d2 or 1
+                    d1, d2  = cur.duration_ms, nxt.duration_ms
+                    total   = d1 + d2 or 1
                     avg_conf = (cur.yolo_confidence * d1 + nxt.yolo_confidence * d2) / total
                     cur = Segment(
                         start_ms=cur.start_ms, end_ms=nxt.end_ms,
-                        object_label=label,
+                        object_label=obj_lbl,
+                        subject_label=subj_lbl,
                         interaction_type=cur.interaction_type,
                         yolo_confidence=avg_conf,
                     )

@@ -419,6 +419,14 @@ class VideoPlayerWidget(QWidget):
         """Remove any seek-bar highlight."""
         self._seek.clear_highlight()
 
+    def seek_to_ms(self, ms: float):
+        """Seek the video to the given millisecond position."""
+        if self._fps <= 0 or self._total_frames <= 0:
+            return
+        frame_index = int(ms / 1000.0 * self._fps)
+        frame_index = max(0, min(frame_index, self._total_frames - 1))
+        self._seek_to(frame_index)
+
     # ------------------------------------------------------------------ calibration overlay API
 
     def set_calibration_mode(self, enabled: bool):

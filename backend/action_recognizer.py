@@ -54,6 +54,7 @@ CLIP_TEMP_FPS         = 8      # fps when writing temp clips (lower = faster)
 # Downloaded by setup_mmaction_configs.py.
 _LABEL_MAPS: dict[str, str] = {
     "kinetics400": "tools/data/kinetics/label_map_k400.txt",
+    "kinetics700": "tools/data/kinetics/label_map_k700.txt",
     "sthv2":       "tools/data/sthv2/label_map.txt",
 }
 
@@ -83,6 +84,18 @@ _CANDIDATE_MODELS: list[dict] = [
             "tsn_imagenet-pretrained-r50_8xb32-1x1x8-50e_sthv2-rgb/"
             "tsn_imagenet-pretrained-r50_8xb32-1x1x8-50e_sthv2-rgb_"
             "20230313-06ad7d03.pth"
+        ),
+    },
+    {
+        "name":    "TSN Kinetics-700",
+        "dataset": "kinetics700",
+        "desc":    "700-category general actions — better child-play coverage than K400",
+        "config":  "tsn/tsn_imagenet-pretrained-r50_8xb32-1x1x3-100e_kinetics700-rgb.py",
+        "checkpoint": (
+            "https://download.openmmlab.com/mmaction/v1.0/recognition/tsn/"
+            "tsn_imagenet-pretrained-r50_8xb32-1x1x3-100e_kinetics700-rgb/"
+            "tsn_imagenet-pretrained-r50_8xb32-1x1x3-100e_kinetics700-rgb_"
+            "20220906-797d6b77.pth"
         ),
     },
 ]

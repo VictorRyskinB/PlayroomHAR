@@ -31,7 +31,7 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
-SCHEMA_VERSION    = "1.2"
+SCHEMA_VERSION    = "1.3"
 CAPTURE_CONF_FLOOR = 0.05   # YOLO floor used when producing new JSONs
 
 
@@ -51,6 +51,7 @@ def save_results(
     frame_h: int,
     total_frames: int,
     action_clips: list | None = None,  # list[ActionClip] — ALL clips, unfiltered
+    yolo_run_settings: dict | None = None,  # run-time settings for same-settings check
 ) -> None:
     """
     Serialize analysis results to a JSON file.
@@ -60,6 +61,7 @@ def save_results(
                  CAPTURE_CONF_FLOOR (0.05).  Storing raw detections lets the
                  UI recompute interactions and segments live when thresholds change.
     """
+    _now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     doc = {
         "schema_version": SCHEMA_VERSION,
         "video_info": {
@@ -70,9 +72,12 @@ def save_results(
             "total_frames": total_frames,
         },
         "processing": {
-            "date":         datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "date":         _now,
             "settings":     settings,
             "modules_used": modules_used,
+            "yolo":         {"date": _now, **(yolo_run_settings or {})},
+            "action":       {},
+            "path":         {},
         },
         "segments": _serialize_segments(segments),
         "frame_detections": {
@@ -83,6 +88,22 @@ def save_results(
     }
 
     output_path = Path(output_path)
+
+    # Preserve sections written by other run types (path_tracking, etc.)
+    if output_path.exists():
+        try:
+            with open(output_path, "r", encoding="utf-8") as f:
+                existing = json.load(f)
+            for section in ("path_tracking",):
+                if section in existing:
+                    doc[section] = existing[section]
+            # Preserve per-run-type processing sub-dicts we're not overwriting
+            for key in ("path",):
+                if existing.get("processing", {}).get(key):
+                    doc["processing"][key] = existing["processing"][key]
+        except Exception:
+            pass  # corrupt or missing existing file — just overwrite cleanly
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(doc, f, indent=2)
@@ -276,3 +297,190 @@ def _ms_to_hms_ms(ms: float) -> str:
 def _trim_ms(hms_ms: str) -> str:
     """'00:00:01.200' → '00:00:01'  (for UI table display)."""
     return hms_ms.split(".")[0]
+
+
+# ---------------------------------------------------------------------------
+# Upsert helpers — update a single section without overwriting the rest
+# ---------------------------------------------------------------------------
+
+def _load_or_create_base(
+    json_path: str | Path,
+    video_path: str | Path,
+    fps: float,
+    fw: int,
+    fh: int,
+    total_frames: int,
+) -> dict:
+    """
+    Load an existing results JSON, or create a minimal skeleton.
+    Ensures processing.yolo / .action / .path sub-dicts exist.
+    """
+    path = Path(json_path)
+    doc: dict = {}
+    if path.exists():
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                doc = json.load(f)
+        except Exception:
+            doc = {}
+
+    doc.setdefault("schema_version", SCHEMA_VERSION)
+    doc.setdefault("video_info", {
+        "filename":     Path(video_path).name,
+        "frame_width":  fw,
+        "frame_height": fh,
+        "fps":          fps,
+        "total_frames": total_frames,
+    })
+    doc.setdefault("processing", {
+        "date": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    })
+    for key in ("yolo", "action", "path"):
+        doc["processing"].setdefault(key, {})
+    return doc
+
+
+def _write_json(doc: dict, path: str | Path) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(doc, f, indent=2)
+
+
+def _serialize_track_points(points: list) -> list:
+    """Serialize list[PathPoint] to a JSON-safe list of dicts."""
+    return [
+        {
+            "frame_index":  p.frame_index,
+            "timestamp_ms": round(p.timestamp_ms, 1),
+            "cx_px":        round(p.cx_px, 1),
+            "cy_px":        round(p.cy_px, 1),
+            "x_cm":         round(p.x_cm, 2) if p.x_cm is not None else None,
+            "y_cm":         round(p.y_cm, 2) if p.y_cm is not None else None,
+            "interpolated": p.interpolated,
+        }
+        for p in points
+    ]
+
+
+def load_path_section(path_section: dict) -> list:
+    """
+    Reconstruct list[PathPoint] from the JSON path_tracking section.
+    Returns [] if the section is absent or malformed.
+    """
+    from backend.path_analyzer import PathPoint
+    pts = []
+    for d in path_section.get("track_points", []):
+        try:
+            pts.append(PathPoint(
+                frame_index  = int(d["frame_index"]),
+                timestamp_ms = float(d["timestamp_ms"]),
+                cx_px        = float(d["cx_px"]),
+                cy_px        = float(d["cy_px"]),
+                x_cm         = float(d["x_cm"]) if d.get("x_cm") is not None else None,
+                y_cm         = float(d["y_cm"]) if d.get("y_cm") is not None else None,
+                interpolated = bool(d.get("interpolated", False)),
+            ))
+        except (KeyError, TypeError, ValueError):
+            continue
+    return pts
+
+
+def upsert_action_section(
+    output_path: str | Path,
+    video_path: str | Path,
+    fps: float,
+    fw: int,
+    fh: int,
+    total_frames: int,
+    action_clips: list,
+    run_settings: dict | None = None,
+) -> None:
+    """Update only the action_recognition section; leave all other sections intact."""
+    doc = _load_or_create_base(output_path, video_path, fps, fw, fh, total_frames)
+    doc["action_recognition"] = _serialize_action_clips(action_clips)
+    if run_settings:
+        doc["processing"]["action"] = {
+            "date": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            **run_settings,
+        }
+    _write_json(doc, output_path)
+
+
+def upsert_path_section(
+    output_path: str | Path,
+    video_path: str | Path,
+    fps: float,
+    fw: int,
+    fh: int,
+    total_frames: int,
+    track_points: list,
+    room_size_cm: tuple,
+    run_settings: dict | None = None,
+) -> None:
+    """Update only the path_tracking section; leave all other sections intact."""
+    from backend.path_analyzer import compute_stats
+
+    doc = _load_or_create_base(output_path, video_path, fps, fw, fh, total_frames)
+
+    stats = compute_stats(track_points)
+    stats_dict: dict = {
+        "n_points":       stats.n_points,
+        "n_interpolated": stats.n_interpolated,
+        "duration_s":     round(stats.duration_s, 2),
+        "calibrated":     stats.calibrated,
+    }
+    if stats.calibrated:
+        stats_dict["total_distance_m"] = round(stats.total_distance_m, 3)
+        stats_dict["avg_speed_m_s"]    = round(stats.avg_speed_m_s, 3)
+        stats_dict["max_speed_m_s"]    = round(stats.max_speed_m_s, 3)
+
+    doc["path_tracking"] = {
+        "room_size_cm": list(room_size_cm),
+        "calibrated":   stats.calibrated,
+        "stats":        stats_dict,
+        "track_points": _serialize_track_points(track_points),
+    }
+    if run_settings:
+        doc["processing"]["path"] = {
+            "date": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            **run_settings,
+        }
+    _write_json(doc, output_path)
+
+
+# ---------------------------------------------------------------------------
+# Run-settings readers  (for same-settings warning)
+# ---------------------------------------------------------------------------
+
+def get_yolo_run_settings(json_path: str | Path) -> dict | None:
+    """Return stored YOLO run settings from processing.yolo, or None."""
+    try:
+        with open(json_path, "r", encoding="utf-8") as f:
+            doc = json.load(f)
+        s = doc.get("processing", {}).get("yolo", {})
+        return s if s else None
+    except Exception:
+        return None
+
+
+def get_action_run_settings(json_path: str | Path) -> dict | None:
+    """Return stored action run settings from processing.action, or None."""
+    try:
+        with open(json_path, "r", encoding="utf-8") as f:
+            doc = json.load(f)
+        s = doc.get("processing", {}).get("action", {})
+        return s if s else None
+    except Exception:
+        return None
+
+
+def get_path_run_settings(json_path: str | Path) -> dict | None:
+    """Return stored path run settings from processing.path, or None."""
+    try:
+        with open(json_path, "r", encoding="utf-8") as f:
+            doc = json.load(f)
+        s = doc.get("processing", {}).get("path", {})
+        return s if s else None
+    except Exception:
+        return None

@@ -19,19 +19,323 @@
 from pathlib import Path
 
 from PyQt6.QtCore import Qt, QThread, QTimer, QSettings, pyqtSignal, QObject
-from PyQt6.QtGui import QAction
+from PyQt6.QtGui import QAction, QColor
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QPushButton, QLabel, QSplitter, QStatusBar,
     QProgressBar, QCheckBox, QFrame, QSpinBox, QDoubleSpinBox,
     QFileDialog, QInputDialog, QTabWidget, QComboBox, QLineEdit, QMenu,
-    QDialog, QDialogButtonBox, QFormLayout,
+    QDialog, QDialogButtonBox, QFormLayout, QMessageBox,
     QListWidget, QListWidgetItem, QScrollArea,
+    QButtonGroup, QRadioButton,
+    QStackedWidget, QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
+    QGridLayout, QSizePolicy,
 )
 
 from ui.video_player import VideoPlayerWidget
 from ui.results_table import ResultsTableWidget, GenericTableWidget
 from mock_data import MOCK_BOUNDING_BOXES, MOCK_RESULTS
+
+
+# ---------------------------------------------------------------------------
+# Themes and parametrized stylesheet
+# ---------------------------------------------------------------------------
+
+_THEMES: dict[str, dict[str, str]] = {
+    "Dark Blue": {
+        "bg":        "#12122a",
+        "bg_alt":    "#1e1e3e",
+        "bg_w":      "#1a1a30",
+        "bg_btn":    "#2e2e5e",
+        "bg_hover":  "#3e3e7e",
+        "bg_press":  "#1e1e4e",
+        "bg_table":  "#1a1a30",
+        "bg_pb":     "#1a1a3a",
+        "text":      "#ddeeff",
+        "text2":     "#aabbcc",
+        "text_dis":  "#555577",
+        "border":    "#4e4e8e",
+        "border2":   "#2a2a4a",
+        "border3":   "#1a3a1a",
+        "accent":    "#5555cc",
+        "accent2":   "#7070cc",
+        "sel":       "#2e2e5e",
+        "parambar":  "#0e0e22",
+        "regionbar": "#0a1a0a",
+    },
+    "Dark Neutral": {
+        "bg":        "#1a1a1a",
+        "bg_alt":    "#242424",
+        "bg_w":      "#1e1e1e",
+        "bg_btn":    "#333333",
+        "bg_hover":  "#404040",
+        "bg_press":  "#222222",
+        "bg_table":  "#1c1c1c",
+        "bg_pb":     "#1e1e1e",
+        "text":      "#dddddd",
+        "text2":     "#999999",
+        "text_dis":  "#555555",
+        "border":    "#555555",
+        "border2":   "#333333",
+        "border3":   "#2a3a2a",
+        "accent":    "#7777aa",
+        "accent2":   "#9999bb",
+        "sel":       "#3a3a3a",
+        "parambar":  "#111111",
+        "regionbar": "#0d1a0d",
+    },
+    "Warm Dark": {
+        "bg":        "#1a1410",
+        "bg_alt":    "#261e16",
+        "bg_w":      "#1e1810",
+        "bg_btn":    "#3a2e1e",
+        "bg_hover":  "#4a3e2e",
+        "bg_press":  "#2a1e10",
+        "bg_table":  "#1c1810",
+        "bg_pb":     "#1e1a10",
+        "text":      "#eeddc8",
+        "text2":     "#bb9977",
+        "text_dis":  "#554433",
+        "border":    "#7a5a3a",
+        "border2":   "#3a2a1a",
+        "border3":   "#1a2a1a",
+        "accent":    "#aa7733",
+        "accent2":   "#cc9955",
+        "sel":       "#3a2e1e",
+        "parambar":  "#100e08",
+        "regionbar": "#0a1408",
+    },
+}
+
+
+def _make_qss(font_pt: int, theme_name: str) -> str:
+    """Build the complete application stylesheet parametrized by font size and theme."""
+    t = _THEMES.get(theme_name, _THEMES["Dark Blue"])
+    return f"""
+        QMainWindow, QWidget {{
+            background: {t['bg']}; color: {t['text']};
+            font-size: {font_pt}pt;
+        }}
+        QPushButton {{
+            background: {t['bg_btn']}; color: {t['text']};
+            border: 1px solid {t['border']};
+            border-radius: 4px; padding: 5px 10px;
+            font-size: {font_pt}pt;
+        }}
+        QPushButton:hover    {{ background: {t['bg_hover']}; }}
+        QPushButton:pressed  {{ background: {t['bg_press']}; }}
+        QPushButton:disabled {{ color: {t['text_dis']}; border-color: {t['border2']}; }}
+        QPushButton#editRegionsBtn:checked {{
+            background: #5e3e1e; border-color: #cc8833; color: #ffcc66;
+        }}
+        QCheckBox {{ spacing: 5px; font-size: {font_pt}pt; }}
+        QCheckBox::indicator {{
+            width: 14px; height: 14px; border: 1px solid {t['border']};
+            border-radius: 3px; background: {t['bg_alt']};
+        }}
+        QCheckBox::indicator:checked {{ background: {t['accent']}; }}
+        QSpinBox, QDoubleSpinBox {{
+            background: {t['bg_alt']}; color: {t['text']};
+            border: 1px solid {t['border']};
+            border-radius: 4px; padding: 2px 4px;
+            font-size: {font_pt}pt;
+        }}
+        QSpinBox::up-button, QSpinBox::down-button,
+        QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {{
+            background: {t['bg_btn']}; border: none; width: 16px;
+        }}
+        QComboBox {{
+            background: {t['bg_alt']}; color: {t['text']};
+            border: 1px solid {t['border']};
+            border-radius: 4px; padding: 2px 4px;
+            font-size: {font_pt}pt;
+        }}
+        QComboBox QAbstractItemView {{
+            background: {t['bg_alt']}; color: {t['text']};
+            border: 1px solid {t['border']};
+            selection-background-color: {t['sel']};
+        }}
+        QLineEdit {{
+            background: {t['bg_alt']}; color: {t['text']};
+            border: 1px solid {t['border']};
+            border-radius: 4px; padding: 2px 4px;
+            font-size: {font_pt}pt;
+        }}
+        QLabel {{ font-size: {font_pt}pt; }}
+        QSlider::groove:horizontal {{
+            height: 4px; background: {t['bg_btn']}; border-radius: 2px;
+        }}
+        QSlider::handle:horizontal {{
+            background: {t['accent2']}; border-radius: 6px;
+            width: 12px; height: 12px; margin: -4px 0;
+        }}
+        QProgressBar {{
+            border: 1px solid {t['border']}; border-radius: 4px;
+            background: {t['bg_pb']}; color: {t['text']}; text-align: center;
+            font-size: {font_pt}pt; max-height: 16px;
+        }}
+        QProgressBar::chunk {{ background: {t['accent']}; border-radius: 3px; }}
+        QHeaderView::section {{
+            background: {t['bg_alt']}; color: {t['text2']}; border: none;
+            padding: 4px; font-size: {font_pt}pt;
+        }}
+        QTableView {{
+            background: {t['bg_table']};
+            alternate-background-color: {t['bg_alt']};
+            color: {t['text']};
+        }}
+        QTabWidget::pane {{
+            border: 1px solid {t['border2']}; background: {t['bg']};
+        }}
+        QTabBar::tab {{
+            background: {t['bg_alt']}; color: {t['text2']};
+            border: 1px solid {t['border2']}; border-bottom: none;
+            padding: 5px 12px; font-size: {font_pt}pt;
+        }}
+        QTabBar::tab:selected {{ background: {t['sel']}; color: {t['text']}; }}
+        QTabBar::tab:hover    {{ background: {t['bg_hover']}; }}
+        QRadioButton {{ font-size: {font_pt}pt; spacing: 5px; }}
+        QScrollBar:vertical {{
+            background: {t['bg']}; width: 10px; border: none;
+        }}
+        QScrollBar::handle:vertical {{
+            background: {t['bg_btn']}; border-radius: 4px; min-height: 20px;
+        }}
+        QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
+        QFrame#banner {{
+            background: #2a1a00; border: 1px solid #664400;
+            border-radius: 4px; padding: 2px;
+        }}
+        QFrame#parambar {{
+            background: {t['parambar']};
+            border-top: 1px solid {t['border2']};
+            border-bottom: 1px solid {t['border2']};
+        }}
+        QFrame#regionbar {{
+            background: {t['regionbar']};
+            border-top: 1px solid {t['border3']};
+            border-bottom: 1px solid {t['border3']};
+        }}
+    """
+
+
+# ---------------------------------------------------------------------------
+# Config dialog  (font size, color theme, recognition window)
+# ---------------------------------------------------------------------------
+
+class _ConfigDialog(QDialog):
+    """App-wide appearance and MMAction2 recognition window settings."""
+
+    def __init__(
+        self,
+        current_size: int,
+        current_theme: str,
+        current_clip_len: int,
+        current_clip_stride: int,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.setWindowTitle("Settings")
+        self.setModal(True)
+        self.setMinimumWidth(360)
+
+        vbox = QVBoxLayout(self)
+        vbox.setSpacing(14)
+
+        # ── Font size ──
+        size_lbl = QLabel("Font size")
+        size_lbl.setStyleSheet("font-weight: bold;")
+        vbox.addWidget(size_lbl)
+
+        self._size_group = QButtonGroup(self)
+        size_row = QHBoxLayout()
+        for label, pt in [("Small", 10), ("Medium", 12), ("Large", 14)]:
+            rb = QRadioButton(f"{label}  ({pt} pt)")
+            rb.setProperty("pt", pt)
+            self._size_group.addButton(rb)
+            size_row.addWidget(rb)
+            if pt == current_size:
+                rb.setChecked(True)
+        vbox.addLayout(size_row)
+
+        # ── Color theme ──
+        theme_lbl = QLabel("Color theme")
+        theme_lbl.setStyleSheet("font-weight: bold;")
+        vbox.addWidget(theme_lbl)
+
+        self._theme_group = QButtonGroup(self)
+        theme_row = QHBoxLayout()
+        for name in _THEMES:
+            rb = QRadioButton(name)
+            self._theme_group.addButton(rb)
+            theme_row.addWidget(rb)
+            if name == current_theme:
+                rb.setChecked(True)
+        vbox.addLayout(theme_row)
+
+        # ── Recognition window ──
+        win_lbl = QLabel("Recognition window  (MMAction2)")
+        win_lbl.setStyleSheet("font-weight: bold;")
+        vbox.addWidget(win_lbl)
+
+        hint = QLabel(
+            "The model reads a sliding window of frames to predict each action.\n"
+            "Window: frames per prediction.  Step: how far to advance each time.\n"
+            "Example — window 32 / step 16 at 30 fps:\n"
+            "  → a prediction every 0.5 s, each covering ~1.1 s of video.\n"
+            "Smaller step = more predictions but slower run.\n"
+            "Smaller window = faster but may miss slow or sustained actions."
+        )
+        hint.setStyleSheet("color: #8899aa; font-size: 10pt;")
+        hint.setWordWrap(True)
+        vbox.addWidget(hint)
+
+        form = QFormLayout()
+        form.setSpacing(8)
+
+        self._clip_len_spin = QSpinBox()
+        self._clip_len_spin.setRange(8, 128)
+        self._clip_len_spin.setSingleStep(8)
+        self._clip_len_spin.setValue(current_clip_len)
+        self._clip_len_spin.setToolTip(
+            "How many video frames the model analyses per prediction.\n"
+            "Larger = more temporal context, slower inference."
+        )
+        form.addRow("Window (frames):", self._clip_len_spin)
+
+        self._clip_stride_spin = QSpinBox()
+        self._clip_stride_spin.setRange(1, 64)
+        self._clip_stride_spin.setSingleStep(4)
+        self._clip_stride_spin.setValue(current_clip_stride)
+        self._clip_stride_spin.setToolTip(
+            "How far to advance the window between predictions.\n"
+            "Step = window → no overlap (fastest).\n"
+            "Step = window / 2 → 50 % overlap (more thorough)."
+        )
+        form.addRow("Step (frames):", self._clip_stride_spin)
+        vbox.addLayout(form)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok |
+            QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        vbox.addWidget(buttons)
+
+    def selected_size(self) -> int:
+        btn = self._size_group.checkedButton()
+        return btn.property("pt") if btn else 12
+
+    def selected_theme(self) -> str:
+        btn = self._theme_group.checkedButton()
+        return btn.text() if btn else "Dark Blue"
+
+    def clip_len(self) -> int:
+        return self._clip_len_spin.value()
+
+    def clip_stride(self) -> int:
+        return self._clip_stride_spin.value()
 
 
 # ---------------------------------------------------------------------------
@@ -318,20 +622,22 @@ class _YoloWorker(QObject):
                  fps: float = 30.0, total_frames: int = 0,
                  yolo_model: str = "yolov8n.pt",
                  world_classes: list | None = None,
-                 enabled_mm_models: list | None = None):
+                 enabled_mm_models: list | None = None,
+                 yolo_run_settings: dict | None = None):
         super().__init__()
-        self._path           = video_path
-        self._fw             = frame_w
-        self._fh             = frame_h
-        self._stride         = frame_stride
-        self._all_classes    = detect_all_classes
-        self._display_conf   = display_conf
-        self._fps            = fps
-        self._total_frames   = total_frames
-        self._yolo_model     = yolo_model
-        self._world_classes  = world_classes
-        self._enabled_mm     = enabled_mm_models   # unused in YOLO-only, kept for symmetry
-        self._cancelled      = False
+        self._path             = video_path
+        self._fw               = frame_w
+        self._fh               = frame_h
+        self._stride           = frame_stride
+        self._all_classes      = detect_all_classes
+        self._display_conf     = display_conf
+        self._fps              = fps
+        self._total_frames     = total_frames
+        self._yolo_model       = yolo_model
+        self._world_classes    = world_classes
+        self._enabled_mm       = enabled_mm_models   # unused in YOLO-only, kept for symmetry
+        self._yolo_run_settings = yolo_run_settings
+        self._cancelled        = False
 
     def cancel(self):
         self._cancelled = True
@@ -400,6 +706,7 @@ class _YoloWorker(QObject):
                 all_classes=self._all_classes,
                 mmaction2_used=False,
                 action_clips=[],
+                yolo_run_settings=self._yolo_run_settings,
             )
 
             diag = (
@@ -435,20 +742,22 @@ class _FullAnalysisWorker(QObject):
                  fps: float = 30.0, total_frames: int = 0,
                  yolo_model: str = "yolov8n.pt",
                  world_classes: list | None = None,
-                 enabled_mm_models: list | None = None):
+                 enabled_mm_models: list | None = None,
+                 yolo_run_settings: dict | None = None):
         super().__init__()
-        self._path           = video_path
-        self._fw             = frame_w
-        self._fh             = frame_h
-        self._stride         = frame_stride
-        self._all_classes    = detect_all_classes
-        self._display_conf   = display_conf
-        self._fps            = fps
-        self._total_frames   = total_frames
-        self._yolo_model     = yolo_model
-        self._world_classes  = world_classes
-        self._enabled_mm     = enabled_mm_models
-        self._cancelled      = False
+        self._path              = video_path
+        self._fw                = frame_w
+        self._fh                = frame_h
+        self._stride            = frame_stride
+        self._all_classes       = detect_all_classes
+        self._display_conf      = display_conf
+        self._fps               = fps
+        self._total_frames      = total_frames
+        self._yolo_model        = yolo_model
+        self._world_classes     = world_classes
+        self._enabled_mm        = enabled_mm_models
+        self._yolo_run_settings = yolo_run_settings
+        self._cancelled         = False
 
     def cancel(self):
         self._cancelled = True
@@ -542,6 +851,7 @@ class _FullAnalysisWorker(QObject):
                 all_classes=self._all_classes,
                 mmaction2_used=mmaction2_used,
                 action_clips=action_clips,
+                yolo_run_settings=self._yolo_run_settings,
             )
 
             diag = (
@@ -742,6 +1052,20 @@ class MainWindow(QMainWindow):
         self._hl_src_row: int = -1      # source-model row index
         self._last_position_ms: int = 0 # last known video position (live path)
 
+        # Appearance / recognition-window settings (persisted via QSettings)
+        self._font_size: int          = 12
+        self._theme_name: str         = "Dark Blue"
+        self._clip_len_frames: int    = 32
+        self._clip_stride_frames: int = 16
+
+        # Analysis panel state
+        self._analysis_smooth_window: int   = 5     # smoothing window (frames)
+        self._analysis_stat_thresh:   float = 0.10  # stationary threshold (m/s)
+        self._analysis_min_ep_ms:     float = 500.0 # min episode duration (ms)
+        self._analysis_episodes:      list  = []    # cached list[MovementEpisode]
+        self._analysis_reg_stats:     list  = []    # cached list[RegionStats]
+        self._analysis_speed_s:       list  = []    # cached list[SpeedSample]
+
         # Debounce timer — refilter fires 250 ms after the last slider change
         self._refilter_timer = QTimer(self)
         self._refilter_timer.setSingleShot(True)
@@ -751,65 +1075,13 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._show_mmaction2_banner()
         self._load_settings()
+        # Re-apply stylesheet so saved font/theme preferences take effect on startup
+        self.setStyleSheet(_make_qss(self._font_size, self._theme_name))
 
     # ------------------------------------------------------------------ layout
 
     def _build_ui(self):
-        self.setStyleSheet("""
-            QMainWindow, QWidget { background: #12122a; color: #dde; }
-            QPushButton {
-                background: #2e2e5e; color: #dde; border: 1px solid #4e4e8e;
-                border-radius: 4px; padding: 5px 10px;
-            }
-            QPushButton:hover    { background: #3e3e7e; }
-            QPushButton:pressed  { background: #1e1e4e; }
-            QPushButton:disabled { color: #555; border-color: #333; }
-            QPushButton#editRegionsBtn:checked {
-                background: #5e3e1e; border-color: #cc8833; color: #ffcc66;
-            }
-            QCheckBox { spacing: 5px; }
-            QCheckBox::indicator {
-                width: 14px; height: 14px; border: 1px solid #4e4e8e;
-                border-radius: 3px; background: #1e1e3e;
-            }
-            QCheckBox::indicator:checked { background: #5555cc; }
-            QSpinBox, QDoubleSpinBox {
-                background: #1e1e3e; color: #dde; border: 1px solid #4e4e8e;
-                border-radius: 4px; padding: 2px 4px;
-            }
-            QSpinBox::up-button, QSpinBox::down-button,
-            QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {
-                background: #2e2e5e; border: none; width: 16px;
-            }
-            QSlider::groove:horizontal { height: 4px; background: #2e2e5e; border-radius: 2px; }
-            QSlider::handle:horizontal {
-                background: #7070cc; border-radius: 6px;
-                width: 12px; height: 12px; margin: -4px 0;
-            }
-            QProgressBar {
-                border: 1px solid #3e3e6e; border-radius: 4px;
-                background: #1a1a3a; color: #dde; text-align: center;
-                font-size: 11px; max-height: 16px;
-            }
-            QProgressBar::chunk { background: #5555cc; border-radius: 3px; }
-            QHeaderView::section {
-                background: #1e1e3e; color: #aab; border: none;
-                padding: 4px; font-size: 12px;
-            }
-            QTableView { background: #1a1a30; alternate-background-color: #1e1e38; color: #dde; }
-            QFrame#banner {
-                background: #2a1a00; border: 1px solid #664400;
-                border-radius: 4px; padding: 2px;
-            }
-            QFrame#parambar {
-                background: #0e0e22; border-top: 1px solid #2a2a4a;
-                border-bottom: 1px solid #2a2a4a;
-            }
-            QFrame#regionbar {
-                background: #0a1a0a; border-top: 1px solid #1a3a1a;
-                border-bottom: 1px solid #1a3a1a;
-            }
-        """)
+        self.setStyleSheet(_make_qss(self._font_size, self._theme_name))
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -902,6 +1174,20 @@ class MainWindow(QMainWindow):
         toolbar.addWidget(self._track_path_btn)
         toolbar.addWidget(self._calibrate_btn)
         toolbar.addWidget(self._load_json_btn)
+        self._analysis_btn = QPushButton("📊 Analysis")
+        self._analysis_btn.setEnabled(False)
+        self._analysis_btn.setToolTip(
+            "Open full-window trajectory analysis:\n"
+            "Summary stats, speed graph, episodes, region metrics, path map.\n"
+            "Run Track Path first to enable."
+        )
+        self._analysis_btn.clicked.connect(self._show_analysis_panel)
+        toolbar.addWidget(self._analysis_btn)
+        self._config_btn = QPushButton("Aa")
+        self._config_btn.setFixedWidth(34)
+        self._config_btn.setToolTip("Font size, color theme, recognition window settings")
+        self._config_btn.clicked.connect(self._open_config_dialog)
+        toolbar.addWidget(self._config_btn)
         self._cancel_btn = QPushButton("✕  Cancel")
         self._cancel_btn.setVisible(False)
         self._cancel_btn.setStyleSheet(
@@ -1104,6 +1390,33 @@ class MainWindow(QMainWindow):
         modelbar.addSpacing(24)
         modelbar.addWidget(_model_label("MMAction2 model:"))
         modelbar.addWidget(self._mmaction2_model_btn)
+        modelbar.addSpacing(24)
+
+        self._action_merge_chk = QCheckBox("Merge clips")
+        self._action_merge_chk.setChecked(False)
+        self._action_merge_chk.setStyleSheet("font-size:11px;")
+        self._action_merge_chk.setToolTip(
+            "Merge consecutive action clips with the same label\n"
+            "if the gap between them is within the threshold below.\n"
+            "Useful to collapse repeated same-action windows into one segment."
+        )
+        self._action_merge_chk.stateChanged.connect(self._schedule_refilter)
+
+        self._action_merge_gap_spin = QSpinBox()
+        self._action_merge_gap_spin.setRange(0, 5000)
+        self._action_merge_gap_spin.setSingleStep(100)
+        self._action_merge_gap_spin.setValue(500)
+        self._action_merge_gap_spin.setFixedWidth(62)
+        self._action_merge_gap_spin.setToolTip(
+            "Maximum gap (ms) between two same-label clips\n"
+            "for them to be merged into one.  0 = only merge overlapping clips."
+        )
+        self._action_merge_gap_spin.valueChanged.connect(self._schedule_refilter)
+
+        modelbar.addWidget(self._action_merge_chk)
+        modelbar.addWidget(_model_label("gap ≤"))
+        modelbar.addWidget(self._action_merge_gap_spin)
+        modelbar.addWidget(_model_label("ms"))
         modelbar.addStretch()
         root.addWidget(modelbar_frame)
 
@@ -1236,8 +1549,8 @@ class MainWindow(QMainWindow):
         root.addWidget(self._source_label)
 
         # ── Content splitter ──
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-        splitter.setHandleWidth(6)
+        self._splitter = QSplitter(Qt.Orientation.Horizontal)
+        self._splitter.setHandleWidth(6)
 
         self._video = VideoPlayerWidget()
         self._video.position_changed.connect(self._on_position_changed)
@@ -1247,18 +1560,6 @@ class MainWindow(QMainWindow):
 
         # ── Three-tab results panel ──
         self._tabs = QTabWidget()
-        self._tabs.setStyleSheet("""
-            QTabWidget::pane {
-                border: 1px solid #2a2a4a; background: #12122a;
-            }
-            QTabBar::tab {
-                background: #1e1e3e; color: #99aacc;
-                border: 1px solid #2a2a4a; border-bottom: none;
-                padding: 5px 12px; font-size: 11px;
-            }
-            QTabBar::tab:selected { background: #2e2e5e; color: #dde; }
-            QTabBar::tab:hover    { background: #262650; }
-        """)
 
         # Tab 0 — YOLO Object Interactions (existing schema)
         self._results = ResultsTableWidget()
@@ -1380,11 +1681,14 @@ class MainWindow(QMainWindow):
 
         self._tabs.addTab(_path_tab_container, "Path & Heatmap")
 
-        splitter.addWidget(self._video)
-        splitter.addWidget(self._tabs)
-        splitter.setStretchFactor(0, 3)
-        splitter.setStretchFactor(1, 2)
-        root.addWidget(splitter, stretch=1)
+        self._splitter.addWidget(self._video)
+        self._splitter.addWidget(self._tabs)
+        self._splitter.setStretchFactor(0, 3)
+        self._splitter.setStretchFactor(1, 2)
+        root.addWidget(self._splitter, stretch=1)
+
+        # ── Analysis panel (initially hidden, takes over full content area) ──
+        self._build_analysis_panel(root)
 
         self._status = QStatusBar()
         self._status.setStyleSheet("color:#888; font-size:11px;")
@@ -1741,6 +2045,7 @@ class MainWindow(QMainWindow):
         try:
             from backend.region_config import save_region_config
             save_region_config(path, config_name.strip(), self._regions)
+            self._settings().setValue("last_regions_path", path)
             self._status.showMessage(
                 f"Regions saved → {Path(path).name}  ({len(self._regions)} regions)"
             )
@@ -1761,6 +2066,7 @@ class MainWindow(QMainWindow):
             self._regions = regions
             self._video.set_regions(self._regions)
             self._update_region_ui()
+            self._settings().setValue("last_regions_path", path)
             self._status.showMessage(
                 f"Regions loaded: '{config_name}'  "
                 f"({len(regions)} region{'s' if len(regions) != 1 else ''})"
@@ -1814,6 +2120,47 @@ class MainWindow(QMainWindow):
 
             self._mock_toggle.setChecked(False)
 
+            # Restore path tracking data if present
+            path_section = data.get("path_tracking", {})
+            if path_section and path_section.get("track_points"):
+                try:
+                    from backend.results_format import load_path_section
+                    from backend.path_analyzer import (
+                        compute_heatmap, heatmap_to_rgba,
+                    )
+                    path_pts = load_path_section(path_section)
+                    self._path_points = path_pts
+                    room_size = tuple(path_section.get("room_size_cm",
+                                                       self._room_size_cm))
+                    self._room_size_cm = room_size
+                    self._path_map.set_room_size(*room_size)
+                    trail = [(p.frame_index, p.cx_px, p.cy_px) for p in path_pts]
+                    self._video.set_trail_points(trail)
+                    self._path_map.set_path(path_pts)
+                    heatmap_grid = compute_heatmap(path_pts, room_size)
+                    if heatmap_grid.max() > 0:
+                        self._path_map.set_heatmap(heatmap_to_rgba(heatmap_grid))
+                    stats_d = path_section.get("stats", {})
+                    if stats_d.get("calibrated"):
+                        stats_text = (
+                            f"Distance: {stats_d.get('total_distance_m', 0):.1f} m  ·  "
+                            f"Avg speed: {stats_d.get('avg_speed_m_s', 0):.2f} m/s  ·  "
+                            f"Duration: {_fmt_dur(stats_d.get('duration_s', 0) * 1000)}  ·  "
+                            f"{stats_d.get('n_points', len(path_pts))} pts"
+                        )
+                    else:
+                        stats_text = (
+                            f"{stats_d.get('n_points', len(path_pts))} track pts  ·  "
+                            "Calibrate camera for real-world distances"
+                        )
+                    self._path_stats_lbl.setText(stats_text)
+                    self._path_stats_lbl.setStyleSheet("font-size:10px; color:#aabbcc;")
+                    self._export_path_btn.setEnabled(True)
+                    self._analysis_btn.setEnabled(True)
+                    self._tabs.setTabText(3, f"Path & Heatmap ({len(path_pts)} pts)")
+                except Exception as path_exc:
+                    print(f"[LoadJSON] Could not restore path data: {path_exc}")
+
             date_str = data["processing"].get("date", "")[:10]
             prefix   = "Auto-loaded" if auto else "Loaded"
             self._source_label.setText(
@@ -1843,6 +2190,9 @@ class MainWindow(QMainWindow):
         min_dur        = int(self._min_dur_spin.value() * 1000)
         filtered_clips = [c for c in self._action_clips
                           if c.confidence >= mm_conf]
+        if self._action_merge_chk.isChecked() and filtered_clips:
+            gap_ms = self._action_merge_gap_spin.value()
+            filtered_clips = _merge_action_clips(filtered_clips, gap_ms)
 
         # ── Tab 2: MMAction2 actions (always available) ──
         self._action_table.set_rows([
@@ -1902,9 +2252,11 @@ class MainWindow(QMainWindow):
             proximity_px=prox,
             subject_labels=self._subject_labels,
         ).map(filtered)
-        segs, ui_boxes = SegmentBuilder(fw, fh, min_duration_ms=min_dur).build(
-            mapped, action_clips=filtered_clips
-        )
+        # Object Interactions tab shows pure YOLO spatial labels only.
+        # MMAction2 clips are displayed separately in the Actions tab — passing
+        # them here would cause apply_action_labels() to replace "near ball" with
+        # "Running ball", mixing two unrelated data streams.
+        segs, ui_boxes = SegmentBuilder(fw, fh, min_duration_ms=min_dur).build(mapped)
         self._video.set_frame_detections(_convert_boxes(ui_boxes))
 
         # Apply subject + label exclusion filters before building table rows
@@ -1987,9 +2339,13 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------ pipeline launchers
 
     def _run_yolo(self):
+        if not self._check_same_settings("yolo"):
+            return
         self._launch_worker(_YoloWorker)
 
     def _run_full(self):
+        if not self._check_same_settings("yolo"):
+            return
         self._launch_worker(_FullAnalysisWorker)
 
     def _run_mmaction2(self):
@@ -1998,6 +2354,8 @@ class MainWindow(QMainWindow):
             self._status.showMessage("No video loaded.")
             return
         if self._worker_thread and self._worker_thread.isRunning():
+            return
+        if not self._check_same_settings("action"):
             return
 
         self._set_running(True)
@@ -2060,6 +2418,7 @@ class MainWindow(QMainWindow):
             yolo_model=yolo_model,
             world_classes=world_cls,
             enabled_mm_models=mm_models,
+            yolo_run_settings=self._get_current_yolo_run_settings(),
         )
         self._worker_thread = QThread()
         self._worker.moveToThread(self._worker_thread)
@@ -2117,6 +2476,26 @@ class MainWindow(QMainWindow):
             return
         self._action_clips = action_clips
 
+        # Upsert action section in JSON (preserves YOLO + path sections)
+        if self._video_path:
+            from backend.results_format import (
+                default_output_path, upsert_action_section,
+            )
+            json_path = default_output_path(self._video_path)
+            try:
+                upsert_action_section(
+                    output_path  = json_path,
+                    video_path   = self._video_path,
+                    fps          = self._video.fps,
+                    fw           = self._video.frame_width,
+                    fh           = self._video.frame_height,
+                    total_frames = self._video.total_frames,
+                    action_clips = action_clips,
+                    run_settings = self._get_current_action_run_settings(),
+                )
+            except Exception as exc:
+                print(f"[UI] WARNING: could not save action JSON: {exc}")
+
         n = len(action_clips)
         self._source_label.setText(
             f"MMAction2 complete  ·  {n} clip{'s' if n != 1 else ''} captured  ·  "
@@ -2134,6 +2513,8 @@ class MainWindow(QMainWindow):
             self._status.showMessage("No video loaded.")
             return
         if self._worker_thread and self._worker_thread.isRunning():
+            return
+        if not self._check_same_settings("path"):
             return
 
         yolo_model = self._get_yolo_model_name()
@@ -2209,7 +2590,29 @@ class MainWindow(QMainWindow):
 
         n = len(path_pts)
         self._tabs.setTabText(3, f"Path & Heatmap ({n} pts)")
+        self._analysis_btn.setEnabled(n > 0)
         self._status.showMessage(f"Path tracking complete — {diagnostic}")
+
+        # Upsert path section in JSON (preserves YOLO + action sections)
+        if self._video_path and path_pts:
+            from backend.results_format import (
+                default_output_path, upsert_path_section,
+            )
+            json_path = default_output_path(self._video_path)
+            try:
+                upsert_path_section(
+                    output_path  = json_path,
+                    video_path   = self._video_path,
+                    fps          = self._video.fps,
+                    fw           = self._video.frame_width,
+                    fh           = self._video.frame_height,
+                    total_frames = self._video.total_frames,
+                    track_points = path_pts,
+                    room_size_cm = self._room_size_cm,
+                    run_settings = self._get_current_path_run_settings(),
+                )
+            except Exception as exc:
+                print(f"[UI] WARNING: could not save path JSON: {exc}")
 
     # ------------------------------------------------------------------ camera calibration
 
@@ -2480,6 +2883,541 @@ class MainWindow(QMainWindow):
                 self._hl_tab     = tab
                 self._hl_src_row = src_row
 
+    # ------------------------------------------------------------------ analysis panel
+
+    def _build_analysis_panel(self, root: QVBoxLayout):
+        """Build the full-window analysis panel (initially hidden)."""
+        from matplotlib.figure import Figure
+        from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+
+        self._analysis_panel = QWidget()
+        self._analysis_panel.setVisible(False)
+        panel_layout = QVBoxLayout(self._analysis_panel)
+        panel_layout.setContentsMargins(8, 4, 8, 4)
+        panel_layout.setSpacing(4)
+
+        # ── Navigation bar ──
+        nav = QHBoxLayout()
+        nav.setSpacing(6)
+
+        back_btn = QPushButton("← Back")
+        back_btn.setFixedWidth(80)
+        back_btn.setToolTip("Return to video + tables view")
+        back_btn.clicked.connect(self._hide_analysis_panel)
+        nav.addWidget(back_btn)
+
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.VLine)
+        sep.setStyleSheet("color: #3a3a5a;")
+        nav.addWidget(sep)
+
+        # Sub-view toggle buttons
+        self._analysis_view_btns: list[QPushButton] = []
+        for i, (icon, name) in enumerate([
+            ("≡", "Summary"),
+            ("📈", "Speed"),
+            ("▶▐", "Episodes"),
+            ("⬡", "Regions"),
+            ("🗺", "Path Map"),
+        ]):
+            btn = QPushButton(f"{icon}  {name}")
+            btn.setCheckable(True)
+            btn.setChecked(i == 0)
+            btn.setFixedWidth(105)
+            btn.clicked.connect(lambda checked, idx=i: self._set_analysis_view(idx))
+            nav.addWidget(btn)
+            self._analysis_view_btns.append(btn)
+
+        nav.addStretch()
+
+        self._analysis_export_btn = QPushButton("Export CSV…")
+        self._analysis_export_btn.setEnabled(False)
+        self._analysis_export_btn.setToolTip("Export current view to CSV")
+        self._analysis_export_btn.clicked.connect(self._export_analysis_csv)
+        nav.addWidget(self._analysis_export_btn)
+
+        panel_layout.addLayout(nav)
+
+        # ── Parameter bar ──
+        param_frame = QFrame()
+        param_frame.setObjectName("parambar")
+        param_bar = QHBoxLayout(param_frame)
+        param_bar.setContentsMargins(8, 4, 8, 4)
+        param_bar.setSpacing(6)
+
+        def _albl(txt):
+            l = QLabel(txt)
+            l.setStyleSheet("font-size:11px; color:#99aacc;")
+            return l
+
+        param_bar.addWidget(_albl("Smooth:"))
+        self._analysis_smooth_spin = QSpinBox()
+        self._analysis_smooth_spin.setRange(1, 31)
+        self._analysis_smooth_spin.setSingleStep(2)
+        self._analysis_smooth_spin.setValue(self._analysis_smooth_window)
+        self._analysis_smooth_spin.setFixedWidth(52)
+        self._analysis_smooth_spin.setToolTip(
+            "Rolling-average window (frames) applied before computing speed and episodes.\n"
+            "Higher = smoother graph lines, less jitter in distance calculations.\n"
+            "1 = no smoothing (raw tracker output)."
+        )
+        self._analysis_smooth_spin.valueChanged.connect(self._on_analysis_param_changed)
+        param_bar.addWidget(self._analysis_smooth_spin)
+        param_bar.addWidget(_albl("frames"))
+
+        param_bar.addSpacing(14)
+        param_bar.addWidget(_albl("Stationary < "))
+        self._analysis_thresh_spin = QDoubleSpinBox()
+        self._analysis_thresh_spin.setRange(0.01, 2.0)
+        self._analysis_thresh_spin.setSingleStep(0.05)
+        self._analysis_thresh_spin.setValue(self._analysis_stat_thresh)
+        self._analysis_thresh_spin.setDecimals(2)
+        self._analysis_thresh_spin.setFixedWidth(70)
+        self._analysis_thresh_spin.setToolTip(
+            "Speed threshold for classifying movement as 'stationary' (m/s).\n"
+            "Points below this speed → stationary episode.\n"
+            "Default 0.10 m/s (10 cm/s).  Adjust for the child's typical pace."
+        )
+        self._analysis_thresh_spin.valueChanged.connect(self._on_analysis_param_changed)
+        param_bar.addWidget(self._analysis_thresh_spin)
+        param_bar.addWidget(_albl("m/s"))
+
+        param_bar.addSpacing(14)
+        param_bar.addWidget(_albl("Min episode:"))
+        self._analysis_minep_spin = QSpinBox()
+        self._analysis_minep_spin.setRange(100, 10000)
+        self._analysis_minep_spin.setSingleStep(100)
+        self._analysis_minep_spin.setValue(int(self._analysis_min_ep_ms))
+        self._analysis_minep_spin.setFixedWidth(68)
+        self._analysis_minep_spin.setToolTip(
+            "Episodes shorter than this (ms) are merged into their neighbours.\n"
+            "Prevents a single noisy frame from fragmenting the episode sequence.\n"
+            "Default 500 ms."
+        )
+        self._analysis_minep_spin.valueChanged.connect(self._on_analysis_param_changed)
+        param_bar.addWidget(self._analysis_minep_spin)
+        param_bar.addWidget(_albl("ms"))
+
+        param_bar.addStretch()
+        panel_layout.addWidget(param_frame)
+
+        # ── Content stack ──
+        self._analysis_stack = QStackedWidget()
+        panel_layout.addWidget(self._analysis_stack, stretch=1)
+
+        # Page 0 — Summary
+        self._build_analysis_summary_page()
+
+        # Page 1 — Speed graph (matplotlib)
+        self._analysis_speed_fig = Figure(tight_layout=True)
+        self._analysis_speed_fig.patch.set_facecolor("#12122a")
+        self._analysis_speed_ax = self._analysis_speed_fig.add_subplot(111)
+        self._analysis_speed_canvas = FigureCanvas(self._analysis_speed_fig)
+        self._analysis_speed_canvas.mpl_connect(
+            "button_press_event", self._on_speed_graph_click
+        )
+        self._analysis_stack.addWidget(self._analysis_speed_canvas)
+
+        # Page 2 — Episodes table
+        self._episodes_table = QTableWidget(0, 7)
+        self._episodes_table.setHorizontalHeaderLabels(
+            ["Start", "End", "Duration", "Type", "Distance", "Avg Speed", "Max Speed"]
+        )
+        hdr = self._episodes_table.horizontalHeader()
+        hdr.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        hdr.setStretchLastSection(True)
+        self._episodes_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self._episodes_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self._episodes_table.setAlternatingRowColors(True)
+        self._episodes_table.clicked.connect(self._on_episode_row_clicked)
+        self._analysis_stack.addWidget(self._episodes_table)
+
+        # Page 3 — Regions table
+        self._regions_analysis_table = QTableWidget(0, 5)
+        self._regions_analysis_table.setHorizontalHeaderLabels(
+            ["Region", "Dwell Time", "% Session", "Visits", "First Visit"]
+        )
+        rhdr = self._regions_analysis_table.horizontalHeader()
+        rhdr.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        rhdr.setStretchLastSection(True)
+        self._regions_analysis_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self._regions_analysis_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self._regions_analysis_table.setAlternatingRowColors(True)
+        self._analysis_stack.addWidget(self._regions_analysis_table)
+
+        # Page 4 — Full-screen path map
+        from ui.path_map_widget import PathMapWidget
+        path_page = QWidget()
+        path_page_layout = QVBoxLayout(path_page)
+        path_page_layout.setContentsMargins(0, 2, 0, 0)
+        path_page_layout.setSpacing(4)
+
+        path_ctrl = QHBoxLayout()
+        path_ctrl.setSpacing(8)
+        self._analysis_show_path_chk = QCheckBox("Path line")
+        self._analysis_show_path_chk.setChecked(True)
+        self._analysis_show_path_chk.stateChanged.connect(
+            lambda s: self._analysis_path_map.set_show_path(bool(s))
+        )
+        self._analysis_show_hm_chk = QCheckBox("Heatmap")
+        self._analysis_show_hm_chk.setChecked(True)
+        self._analysis_show_hm_chk.stateChanged.connect(
+            lambda s: self._analysis_path_map.set_show_heatmap(bool(s))
+        )
+        path_ctrl.addWidget(self._analysis_show_path_chk)
+        path_ctrl.addWidget(self._analysis_show_hm_chk)
+        path_ctrl.addStretch()
+        path_page_layout.addLayout(path_ctrl)
+
+        self._analysis_path_map = PathMapWidget(room_size_cm=self._room_size_cm)
+        path_page_layout.addWidget(self._analysis_path_map, stretch=1)
+        self._analysis_stack.addWidget(path_page)
+
+        root.addWidget(self._analysis_panel, stretch=1)
+
+    def _build_analysis_summary_page(self):
+        """Build the scrollable summary statistics page (page 0 of _analysis_stack)."""
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+
+        inner = QWidget()
+        grid  = QGridLayout(inner)
+        grid.setSpacing(10)
+        grid.setContentsMargins(20, 20, 20, 20)
+        grid.setColumnStretch(1, 1)
+        grid.setColumnStretch(3, 1)
+        grid.setColumnStretch(5, 1)
+
+        self._summary_labels: dict[str, QLabel] = {}
+
+        stat_defs = [
+            # (key, display_name)
+            ("total_distance",  "Total Distance"),
+            ("avg_speed",       "Avg Speed"),
+            ("max_speed",       "Peak Speed"),
+            ("duration",        "Session Duration"),
+            ("coverage",        "Floor Coverage"),
+            ("active_ratio",    "Active / Stationary"),
+            ("n_active_ep",     "Active Episodes"),
+            ("n_stationary_ep", "Stationary Episodes"),
+            ("avg_active_dur",  "Avg Active Duration"),
+            ("avg_stat_dur",    "Avg Stationary Dur."),
+            ("n_points",        "Track Points"),
+            ("n_interp",        "Interpolated Points"),
+        ]
+
+        for i, (key, label) in enumerate(stat_defs):
+            row = i // 3
+            col = (i % 3) * 2
+
+            name_lbl = QLabel(label)
+            name_lbl.setStyleSheet(
+                "font-size:10px; color:#7799bb; font-weight:bold;"
+                " padding-right:6px;"
+            )
+            name_lbl.setAlignment(
+                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+            )
+
+            val_lbl = QLabel("—")
+            val_lbl.setStyleSheet("font-size:17px; color:#ddeeff;")
+            val_lbl.setAlignment(
+                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+            )
+            val_lbl.setMinimumWidth(160)
+
+            grid.addWidget(name_lbl, row, col)
+            grid.addWidget(val_lbl,  row, col + 1)
+            self._summary_labels[key] = val_lbl
+
+        grid.setRowStretch(len(stat_defs) // 3 + 1, 1)
+        scroll.setWidget(inner)
+        self._analysis_stack.addWidget(scroll)
+
+    # ------------------------------------------------------------------ analysis control
+
+    def _show_analysis_panel(self):
+        """Hide video+tabs splitter and show the full-window analysis panel."""
+        self._splitter.hide()
+        self._analysis_panel.show()
+        self._refresh_analysis()
+
+    def _hide_analysis_panel(self):
+        """Return to normal video + tables view."""
+        self._analysis_panel.hide()
+        self._splitter.show()
+
+    def _set_analysis_view(self, index: int):
+        """Switch the analysis sub-view and update toggle-button states."""
+        for i, btn in enumerate(self._analysis_view_btns):
+            btn.setChecked(i == index)
+        self._analysis_stack.setCurrentIndex(index)
+
+    def _on_analysis_param_changed(self):
+        """Called when smooth / threshold / min-episode spinboxes change."""
+        self._analysis_smooth_window = self._analysis_smooth_spin.value()
+        self._analysis_stat_thresh   = self._analysis_thresh_spin.value()
+        self._analysis_min_ep_ms     = float(self._analysis_minep_spin.value())
+        if self._analysis_panel.isVisible():
+            self._refresh_analysis()
+
+    def _refresh_analysis(self):
+        """Smooth the path, recompute all metrics, update every sub-view."""
+        if not self._path_points:
+            return
+
+        from backend.path_analyzer import (
+            smooth_path, compute_stats, compute_speed_series,
+            compute_episodes, episode_summary,
+            compute_region_stats, compute_coverage_pct,
+            compute_heatmap, heatmap_to_rgba,
+        )
+
+        pts = smooth_path(self._path_points, window=self._analysis_smooth_window)
+
+        stats    = compute_stats(pts)
+        speed_s  = compute_speed_series(pts)
+        episodes = compute_episodes(
+            pts,
+            stationary_threshold_m_s = self._analysis_stat_thresh,
+            min_episode_ms           = self._analysis_min_ep_ms,
+        )
+        ep_sum   = episode_summary(episodes)
+        fw, fh   = self._analysis_fw, self._analysis_fh
+        regions  = getattr(self, "_regions", [])
+        reg_stats = (
+            compute_region_stats(pts, regions, fw, fh)
+            if regions and fw > 0 else []
+        )
+        coverage = (
+            compute_coverage_pct(pts, self._room_size_cm)
+            if stats.calibrated else 0.0
+        )
+
+        # Cache for export
+        self._analysis_episodes  = episodes
+        self._analysis_reg_stats = reg_stats
+        self._analysis_speed_s   = speed_s
+        self._analysis_stats     = stats
+
+        self._update_analysis_summary(stats, ep_sum, coverage)
+        self._update_speed_graph(speed_s, episodes)
+        self._update_episodes_table(episodes)
+        self._update_regions_table(reg_stats)
+
+        # Full-screen path map
+        self._analysis_path_map.set_room_size(*self._room_size_cm)
+        self._analysis_path_map.set_path(pts)
+        grid = compute_heatmap(pts, self._room_size_cm)
+        if grid.max() > 0:
+            self._analysis_path_map.set_heatmap(heatmap_to_rgba(grid))
+        else:
+            self._analysis_path_map.set_heatmap(None)
+
+        self._analysis_export_btn.setEnabled(True)
+
+    def _update_analysis_summary(self, stats, ep_sum: dict, coverage: float):
+        lbl = self._summary_labels
+        if stats.calibrated:
+            lbl["total_distance"].setText(f"{stats.total_distance_m:.2f} m")
+            lbl["avg_speed"].setText(f"{stats.avg_speed_m_s:.3f} m/s")
+            lbl["max_speed"].setText(f"{stats.max_speed_m_s:.3f} m/s")
+            lbl["coverage"].setText(f"{coverage:.1f} %")
+        else:
+            lbl["total_distance"].setText("(no calibration)")
+            lbl["avg_speed"].setText("(no calibration)")
+            lbl["max_speed"].setText("(no calibration)")
+            lbl["coverage"].setText("(no calibration)")
+        lbl["duration"].setText(_fmt_dur(stats.duration_s * 1000))
+        lbl["n_points"].setText(str(stats.n_points))
+        lbl["n_interp"].setText(str(stats.n_interpolated))
+        active_pct = ep_sum.get("active_ratio", 0.0) * 100.0
+        stat_pct   = 100.0 - active_pct
+        lbl["active_ratio"].setText(f"{active_pct:.1f} % / {stat_pct:.1f} %")
+        lbl["n_active_ep"].setText(str(ep_sum.get("n_active_episodes", 0)))
+        lbl["n_stationary_ep"].setText(str(ep_sum.get("n_stationary_episodes", 0)))
+        lbl["avg_active_dur"].setText(
+            f"{ep_sum.get('avg_active_dur_s', 0.0):.1f} s"
+        )
+        lbl["avg_stat_dur"].setText(
+            f"{ep_sum.get('avg_stationary_dur_s', 0.0):.1f} s"
+        )
+
+    def _update_speed_graph(self, speed_series: list, episodes: list):
+        ax = self._analysis_speed_ax
+        ax.clear()
+
+        if not speed_series:
+            self._analysis_speed_canvas.draw()
+            return
+
+        ts_s = [s.timestamp_ms / 1000.0 for s in speed_series]
+        spds = [s.speed_m_s for s in speed_series]
+
+        # Shade episode regions
+        for ep in episodes:
+            color = "#1a3a1a" if ep.kind == "active" else "#3a1a1a"
+            ax.axvspan(
+                ep.start_ms / 1000.0, ep.end_ms / 1000.0,
+                alpha=0.35, color=color, linewidth=0,
+            )
+
+        ax.plot(ts_s, spds, color="#5588ff", linewidth=1.0, alpha=0.9)
+        ax.axhline(
+            self._analysis_stat_thresh,
+            color="#ff8844", linewidth=0.9,
+            linestyle="--", alpha=0.8,
+            label=f"Threshold  {self._analysis_stat_thresh:.2f} m/s",
+        )
+
+        ax.set_xlabel("Time (s)", color="#aabbcc", fontsize=9)
+        ax.set_ylabel("Speed (m/s)", color="#aabbcc", fontsize=9)
+        ax.set_title(
+            "Speed over Time  —  click to seek video",
+            color="#ddeeff", fontsize=10,
+        )
+        ax.tick_params(colors="#aabbcc", labelsize=8)
+        ax.set_facecolor("#0e0e22")
+        self._analysis_speed_fig.patch.set_facecolor("#12122a")
+        for spine in ("bottom", "left"):
+            ax.spines[spine].set_color("#3a3a5a")
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.legend(
+            fontsize=8, labelcolor="#aabbcc",
+            facecolor="#1e1e3e", edgecolor="#3a3a5a",
+        )
+        ax.grid(True, color="#1e1e3e", linewidth=0.5, alpha=0.6)
+        self._analysis_speed_canvas.draw()
+
+    def _on_speed_graph_click(self, event):
+        """Seek video to the clicked time on the speed graph."""
+        if event.xdata is None:
+            return
+        seek_ms = max(0, int(event.xdata * 1000))
+        self._video.seek_to_ms(seek_ms)
+
+    def _update_episodes_table(self, episodes: list):
+        tbl = self._episodes_table
+        tbl.setRowCount(len(episodes))
+        for row, ep in enumerate(episodes):
+            vals = ep.as_table_row()
+            for col, val in enumerate(vals):
+                item = QTableWidgetItem(val)
+                item.setFlags(Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
+                if ep.kind == "active":
+                    item.setForeground(QColor("#88dd88"))
+                else:
+                    item.setForeground(QColor("#dd8888"))
+                tbl.setItem(row, col, item)
+        tbl.resizeColumnsToContents()
+
+    def _on_episode_row_clicked(self, index):
+        """Seek video to the start of the clicked episode."""
+        row = index.row()
+        if 0 <= row < len(self._analysis_episodes):
+            seek_ms = int(self._analysis_episodes[row].start_ms)
+            self._video.seek_to_ms(seek_ms)
+
+    def _update_regions_table(self, reg_stats: list):
+        tbl = self._regions_analysis_table
+        tbl.setRowCount(len(reg_stats))
+        for row, rs in enumerate(reg_stats):
+            for col, val in enumerate(rs.as_summary_row()):
+                item = QTableWidgetItem(val)
+                item.setFlags(Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
+                tbl.setItem(row, col, item)
+        tbl.resizeColumnsToContents()
+
+    def _export_analysis_csv(self):
+        """Export the currently visible analysis sub-view to a CSV file."""
+        import csv
+        view = self._analysis_stack.currentIndex()
+        view_names = ["summary", "speed", "episodes", "regions", "path_map"]
+        view_name  = view_names[view] if view < len(view_names) else "data"
+
+        default_stem = Path(self._video_path).stem if self._video_path else "analysis"
+        default_dir  = str(Path(self._video_path).parent) if self._video_path else ""
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export Analysis CSV",
+            str(Path(default_dir) / f"{default_stem}_{view_name}.csv"),
+            "CSV files (*.csv)",
+        )
+        if not path:
+            return
+
+        try:
+            if view == 0:  # Summary
+                rows = []
+                st = getattr(self, "_analysis_stats", None)
+                for key, lbl in self._summary_labels.items():
+                    rows.append([key, lbl.text()])
+                with open(path, "w", newline="", encoding="utf-8") as f:
+                    csv.writer(f).writerows([["Metric", "Value"]] + rows)
+
+            elif view == 1:  # Speed
+                header = ["timestamp_ms", "speed_m_s", "speed_cm_s"]
+                rows   = [
+                    [f"{s.timestamp_ms:.1f}", f"{s.speed_m_s:.4f}", f"{s.speed_cm_s:.2f}"]
+                    for s in self._analysis_speed_s
+                ]
+                with open(path, "w", newline="", encoding="utf-8") as f:
+                    csv.writer(f).writerows([header] + rows)
+
+            elif view == 2:  # Episodes
+                header = ["Start", "End", "Duration_s", "Type",
+                          "Distance_m", "Avg_Speed_m_s", "Max_Speed_m_s"]
+                rows = []
+                for ep in self._analysis_episodes:
+                    rows.append([
+                        f"{ep.start_ms:.0f}", f"{ep.end_ms:.0f}",
+                        f"{ep.duration_s:.3f}", ep.kind,
+                        f"{ep.distance_m:.4f}", f"{ep.avg_speed_m_s:.4f}",
+                        f"{ep.max_speed_m_s:.4f}",
+                    ])
+                with open(path, "w", newline="", encoding="utf-8") as f:
+                    csv.writer(f).writerows([header] + rows)
+
+            elif view == 3:  # Regions summary
+                header = ["Region", "Dwell_s", "Dwell_pct", "Visit_count",
+                          "First_visit_ms"]
+                rows = []
+                for rs in self._analysis_reg_stats:
+                    rows.append([
+                        rs.region_name,
+                        f"{rs.total_dwell_s:.3f}",
+                        f"{rs.dwell_pct:.2f}",
+                        str(rs.visit_count),
+                        f"{rs.first_visit_ms:.0f}" if rs.first_visit_ms is not None else "",
+                    ])
+                with open(path, "w", newline="", encoding="utf-8") as f:
+                    csv.writer(f).writerows([header] + rows)
+
+            elif view == 4:  # Path map — export raw smoothed path points
+                header = ["frame_index", "timestamp_ms", "cx_px", "cy_px",
+                          "x_cm", "y_cm", "interpolated"]
+                from backend.path_analyzer import smooth_path
+                pts = smooth_path(self._path_points, self._analysis_smooth_window)
+                rows = [
+                    [p.frame_index, f"{p.timestamp_ms:.1f}",
+                     f"{p.cx_px:.1f}", f"{p.cy_px:.1f}",
+                     f"{p.x_cm:.2f}" if p.x_cm is not None else "",
+                     f"{p.y_cm:.2f}" if p.y_cm is not None else "",
+                     int(p.interpolated)]
+                    for p in pts
+                ]
+                with open(path, "w", newline="", encoding="utf-8") as f:
+                    csv.writer(f).writerows([header] + rows)
+
+            self._status.showMessage(f"Exported: {Path(path).name}")
+
+        except Exception as exc:
+            QMessageBox.warning(self, "Export failed", str(exc))
+
+    # ------------------------------------------------------------------ workers
+
     def _cancel_worker(self):
         """Request cancellation of the currently running worker."""
         if self._worker is not None and hasattr(self._worker, "cancel"):
@@ -2539,6 +3477,97 @@ class MainWindow(QMainWindow):
         self._hl_src_row = -1
         self._video.clear_seekbar_highlight()
 
+    # ------------------------------------------------------------------ config / settings
+
+    def _open_config_dialog(self):
+        dlg = _ConfigDialog(
+            current_size        = self._font_size,
+            current_theme       = self._theme_name,
+            current_clip_len    = self._clip_len_frames,
+            current_clip_stride = self._clip_stride_frames,
+            parent              = self,
+        )
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self._font_size          = dlg.selected_size()
+            self._theme_name         = dlg.selected_theme()
+            self._clip_len_frames    = dlg.clip_len()
+            self._clip_stride_frames = dlg.clip_stride()
+            self.setStyleSheet(_make_qss(self._font_size, self._theme_name))
+
+    # ------------------------------------------------------------------ run-settings helpers
+
+    def _get_current_yolo_run_settings(self) -> dict:
+        yolo_model = self._get_yolo_model_name()
+        is_world   = "world" in yolo_model.lower()
+        return {
+            "yolo_model":         yolo_model,
+            "frame_stride":       self._sample_spin.value(),
+            "detect_all_classes": self._all_classes_chk.isChecked(),
+            "world_classes":      sorted(self._world_classes) if is_world else [],
+        }
+
+    def _get_current_action_run_settings(self) -> dict:
+        return {
+            "enabled_models": self._get_enabled_mmaction2_models(),
+            "clip_length":    self._clip_len_frames,
+            "clip_stride":    self._clip_stride_frames,
+        }
+
+    def _get_current_path_run_settings(self) -> dict:
+        return {
+            "yolo_model": self._get_yolo_model_name(),
+        }
+
+    def _check_same_settings(self, run_type: str) -> bool:
+        """
+        Compare current run settings with what's stored in the JSON.
+        Returns True  = proceed with run (settings differ, or user confirmed).
+        Returns False = user cancelled.
+        """
+        if not self._video_path:
+            return True
+        from backend.results_format import (
+            default_output_path,
+            get_yolo_run_settings, get_action_run_settings, get_path_run_settings,
+        )
+        json_path = default_output_path(self._video_path)
+        if not json_path.exists():
+            return True
+
+        if run_type == "yolo":
+            stored  = get_yolo_run_settings(json_path)
+            current = self._get_current_yolo_run_settings()
+        elif run_type == "action":
+            stored  = get_action_run_settings(json_path)
+            current = self._get_current_action_run_settings()
+        elif run_type == "path":
+            stored  = get_path_run_settings(json_path)
+            current = self._get_current_path_run_settings()
+        else:
+            return True
+
+        if not stored:
+            return True
+
+        # Strip the stored date before comparing
+        stored_cmp = {k: v for k, v in stored.items() if k != "date"}
+        if stored_cmp != current:
+            return True  # Settings differ — proceed without warning
+
+        # Identical settings — warn the user
+        msg = QMessageBox(self)
+        msg.setWindowTitle("Same settings as last run")
+        msg.setText(
+            "The current settings match the last saved run for this video.\n"
+            "Running again will overwrite the existing results."
+        )
+        msg.setInformativeText("Run anyway?")
+        msg.setStandardButtons(
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel
+        )
+        msg.setDefaultButton(QMessageBox.StandardButton.Cancel)
+        return msg.exec() == QMessageBox.StandardButton.Yes
+
     # ------------------------------------------------------------------ settings persistence
 
     def _settings(self) -> QSettings:
@@ -2574,6 +3603,25 @@ class MainWindow(QMainWindow):
         subj_text = s.value("subject_classes_text", "")
         if subj_text:
             self._subject_classes_edit.setText(subj_text)
+        # Appearance / recognition-window
+        self._font_size          = int(  s.value("font_size",         12))
+        self._theme_name         = str(  s.value("theme_name",        "Dark Blue"))
+        self._clip_len_frames    = int(  s.value("clip_len_frames",   32))
+        self._clip_stride_frames = int(  s.value("clip_stride_frames",16))
+        # Merge controls
+        self._action_merge_chk.setChecked(  s.value("action_merge",      False, type=bool))
+        self._action_merge_gap_spin.setValue(int(s.value("action_merge_gap", 500)))
+        # Auto-reload last-used regions file
+        last_regions = s.value("last_regions_path", "")
+        if last_regions and Path(last_regions).exists():
+            try:
+                from backend.region_config import load_region_config
+                config_name, regions = load_region_config(last_regions)
+                self._regions = regions
+                self._video.set_regions(self._regions)
+                self._update_region_ui()
+            except Exception:
+                pass   # silently skip — file may be corrupt or moved
 
     def _save_settings(self):
         s = self._settings()
@@ -2590,8 +3638,14 @@ class MainWindow(QMainWindow):
         s.setValue("yolo_model_idx",      self._yolo_model_combo.currentIndex())
         for act in self._mm_model_actions:
             s.setValue(f"mm_model_{act.data()}", act.isChecked())
-        s.setValue("world_classes_text",  self._world_classes_edit.text())
-        s.setValue("subject_classes_text",self._subject_classes_edit.text())
+        s.setValue("world_classes_text",   self._world_classes_edit.text())
+        s.setValue("subject_classes_text", self._subject_classes_edit.text())
+        s.setValue("font_size",            self._font_size)
+        s.setValue("theme_name",           self._theme_name)
+        s.setValue("clip_len_frames",      self._clip_len_frames)
+        s.setValue("clip_stride_frames",   self._clip_stride_frames)
+        s.setValue("action_merge",         self._action_merge_chk.isChecked())
+        s.setValue("action_merge_gap",     self._action_merge_gap_spin.value())
 
     def closeEvent(self, event):
         self._save_settings()
@@ -2601,6 +3655,36 @@ class MainWindow(QMainWindow):
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _merge_action_clips(clips: list, gap_ms: float) -> list:
+    """
+    Merge consecutive clips that share the same action_label and whose gap
+    is within gap_ms, keeping the max confidence and spanning start→end.
+    Input clips do not need to be sorted (sorted internally).
+    """
+    if not clips:
+        return clips
+    from backend.action_recognizer import ActionClip
+    sorted_clips = sorted(clips, key=lambda c: c.start_ms)
+    merged = []
+    cur = sorted_clips[0]
+    for nxt in sorted_clips[1:]:
+        if (nxt.action_label == cur.action_label
+                and nxt.start_ms - cur.end_ms <= gap_ms):
+            cur = ActionClip(
+                start_ms     = cur.start_ms,
+                end_ms       = max(cur.end_ms, nxt.end_ms),
+                action_label = cur.action_label,
+                raw_label    = cur.raw_label,
+                confidence   = max(cur.confidence, nxt.confidence),
+                model_name   = cur.model_name,
+            )
+        else:
+            merged.append(cur)
+            cur = nxt
+    merged.append(cur)
+    return merged
+
 
 def _filter_frames(raw_frames: list, conf_threshold: float) -> list:
     """Return FrameDetections list keeping only detections ≥ conf_threshold."""
@@ -2622,6 +3706,7 @@ def _save_results_quietly(
     fps, frame_w, frame_h, total_frames,
     stride, display_conf, all_classes, mmaction2_used,
     action_clips=None,
+    yolo_run_settings=None,
 ) -> "Path | None":
     """Save _results.json next to the video.  Never raises — logs on failure."""
     try:
@@ -2656,6 +3741,7 @@ def _save_results_quietly(
             frame_h=frame_h,
             total_frames=total_frames,
             action_clips=action_clips or [],
+            yolo_run_settings=yolo_run_settings,
         )
         print(f"[UI] Results saved → {output_path}")
         return output_path

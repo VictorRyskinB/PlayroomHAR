@@ -222,6 +222,193 @@ def _make_qss(font_pt: int, theme_name: str) -> str:
 # Config dialog  (font size, color theme, recognition window)
 # ---------------------------------------------------------------------------
 
+class _UserGuideDialog(QDialog):
+    """Scrollable in-app user guide."""
+
+    _GUIDE_HTML = """
+<h2>Getting Started</h2>
+<ul>
+<li>Open any video file (MP4, AVI, MOV, etc.).</li>
+<li>If results from a previous session exist (a <code>_results.json</code> file next to
+the video), they load automatically.</li>
+<li>The last-used regions file is auto-loaded on startup.</li>
+</ul>
+
+<h2>First-Time Camera Setup</h2>
+<p><b>Before Track Path gives meaningful results</b>, you need to calibrate the camera.</p>
+<ol>
+<li>Click <b>Calibrate Camera</b> &mdash; it asks for the room width and depth in
+centimetres.</li>
+<li>You then click 4 known floor points in the video frame and type their
+real-world X, Y positions (in cm).</li>
+<li>The coordinate system: origin = front-left corner (camera side, left),
++X = across the room width, +Y = toward the far wall.</li>
+</ol>
+<p>Calibration is saved automatically as a <code>.homography.json</code> file next to the
+video &mdash; it auto-loads next time you open that video.</p>
+<p>You can also <b>Save Cal</b> / <b>Load Cal</b> to share calibration between videos
+from the same camera angle.</p>
+<p><b>Without calibration:</b> Track Path still works (you get a path and point count),
+but all distances, speeds, and Analysis metrics will show &ldquo;no calibration&rdquo;.</p>
+
+<h2>Running Analysis</h2>
+<ul>
+<li><b>Run YOLO</b> &mdash; Detects objects (child, toys, etc.) in every frame. Required
+before anything else.</li>
+<li><b>Track Path</b> &mdash; Uses ByteTrack to follow the child across frames, then maps
+pixel positions to floor coordinates using the calibration. Requires YOLO data.</li>
+<li><b>Run All</b> &mdash; Runs YOLO then Track Path automatically in sequence. The
+recommended one-click option.</li>
+</ul>
+<p>Results are auto-saved to <code>&lt;videoname&gt;_results.json</code> next to the video file.
+If you run with the same settings as last time, the app warns you before
+overwriting.</p>
+
+<h2>Toolbar Parameters</h2>
+<ul>
+<li><b>All objects</b> &mdash; When checked, YOLO detects all 80 COCO classes. When
+unchecked, uses a curated playroom subset. Changes require a re-run.</li>
+<li><b>Sample every N frames</b> &mdash; Process every Nth frame (1 = every frame). Lower
+= faster but less data. Changes require a re-run.</li>
+<li><b>YOLO conf</b> &mdash; Confidence threshold for displaying detections. This is a
+<b>live filter</b> &mdash; drag it and results update instantly, no re-run needed.</li>
+<li><b>Min duration</b> &mdash; Minimum duration for region presence segments. Also a
+<b>live filter</b>.</li>
+<li><b>YOLO boxes / Trail</b> &mdash; Toggle visibility overlays on the video. Cosmetic
+only.</li>
+</ul>
+
+<h2>YOLO Models</h2>
+<p>Multiple YOLO model sizes are available (nano through extra-large). Larger =
+more accurate but slower.</p>
+<p><b>YOLO-World</b> is an open-vocabulary model. When selected, a text field appears
+where you type comma-separated class names (e.g. &ldquo;toy, ball, slinky,
+book&rdquo;). Plain English nouns work best.</p>
+<p>Class lists can be saved/loaded as <code>.classes.json</code> files.</p>
+
+<h2>Regions</h2>
+<p>Regions are named rectangular zones drawn on the video frame (e.g.
+&ldquo;Toy shelf&rdquo;, &ldquo;Play mat&rdquo;).</p>
+<ul>
+<li>Toggle <b>Edit Regions</b>, then drag a rectangle on the video. You will be
+prompted to name it.</li>
+<li>Regions are stored in normalised coordinates (resolution-independent) &mdash; the
+same config works for any video from that camera.</li>
+<li><b>Save Regions</b> / <b>Load Regions</b> persist to <code>.regions.json</code>
+files. The last-used file auto-reloads on next app launch.</li>
+<li>The <b>Regions tab</b> shows time segments where the child was detected inside
+each region.</li>
+<li>Region presence is calculated from YOLO bounding boxes (foot-line overlap),
+not from the tracked path.</li>
+</ul>
+
+<h2>Path &amp; Heatmap Tab</h2>
+<ul>
+<li>Shows the child's movement path on a top-down floor map.</li>
+<li><b>Path line</b> &mdash; Blue-to-red gradient showing early-to-late trajectory.
+Dotted segments = interpolated frames.</li>
+<li><b>Heatmap</b> &mdash; Density overlay (blue = low, red = high dwell time).</li>
+<li><b>Regions overlay</b> &mdash; Shows named regions projected onto the floor map
+(requires calibration).</li>
+<li><b>Live path</b> &mdash; When enabled, the map shows the path up to the current
+video playhead position. Scrub the video to watch the path grow.</li>
+<li><b>Export Path CSV</b> &mdash; Exports raw path points (frame, timestamp, pixel
+coords, world coords).</li>
+</ul>
+
+<h2>Analysis Panel</h2>
+<p>Click <b>Analysis</b> (enabled after Track Path completes) to open the full-window
+analysis view. Press <b>Back</b> to return to the normal video + tables view.</p>
+
+<h3>Summary</h3>
+<p>Key metrics in a grid: total distance, average/peak speed, session duration,
+floor coverage %, active/stationary ratio, episode counts, average durations,
+point counts. Distances and speeds require calibration.</p>
+
+<h3>Speed Graph</h3>
+<p>Speed over time with episode shading (green = active, red = stationary). The
+orange dashed line is the stationary threshold. <b>Click anywhere on the graph to
+seek the video to that moment.</b></p>
+
+<h3>Episodes Table</h3>
+<p>Lists each active and stationary period with start/end times, duration,
+distance, and speed. Active rows are green, stationary are red. <b>Click a row to
+seek the video to that episode's start.</b></p>
+
+<h3>Regions Table</h3>
+<p>Per-region dwell time (seconds and %), visit count, and first-visit latency.</p>
+
+<h3>Path Map</h3>
+<p>Same path map as the tab, but full-screen &mdash; useful for presentations and
+screenshots.</p>
+
+<h3>Analysis Parameters</h3>
+<ul>
+<li><b>Smooth</b> &mdash; Rolling-average window (frames) applied before computing speed.
+Higher = smoother, less tracker noise. 1 = raw.</li>
+<li><b>Stationary threshold</b> &mdash; Speed below this (m/s) counts as stationary.
+Default 0.10 m/s (10 cm/s). Adjust for the child's typical pace.</li>
+<li><b>Min episode</b> &mdash; Episodes shorter than this (ms) get merged into neighbours.
+Prevents single noisy frames from creating false micro-episodes. Default
+500 ms.</li>
+</ul>
+<p>All parameters update the analysis in real time &mdash; experiment freely.</p>
+<p><b>Export CSV</b> exports the currently visible sub-view to CSV.</p>
+
+<h2>Appearance</h2>
+<p>Click the <b>Aa</b> button for font size (10 / 12 / 14 pt) and colour theme
+(Dark Blue, Dark Neutral, Warm Dark).</p>
+
+<h2>Tips &amp; Caveats</h2>
+<ul>
+<li>The calibration is <b>camera-specific</b> &mdash; if you move the camera,
+recalibrate.</li>
+<li>Track Path finds the most prominent &ldquo;person&rdquo; detection per frame. If
+multiple children are visible, results may be unreliable.</li>
+<li>Region presence (Regions tab) uses YOLO bounding boxes, while the Analysis
+panel's region stats use the tracked path centroid. Numbers may differ
+slightly.</li>
+<li>When loading a new video, all old data is cleared automatically. If the new
+video has partial results (e.g. YOLO but no path tracking), only the available
+data is shown.</li>
+<li>All results are saved per-video. Changing filter settings (YOLO conf, min
+duration) does <b>not</b> require re-running &mdash; these update live.</li>
+</ul>
+"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("User Guide")
+        self.setModal(True)
+        self.setMinimumSize(640, 520)
+        self.resize(720, 600)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 8)
+
+        from PyQt6.QtWidgets import QTextBrowser
+        browser = QTextBrowser()
+        browser.setOpenExternalLinks(False)
+        browser.setHtml(self._GUIDE_HTML)
+        browser.setStyleSheet(
+            "QTextBrowser {"
+            "  background: #14142e; color: #ddeeff;"
+            "  font-size: 12pt; padding: 16px;"
+            "  border: none;"
+            "}"
+        )
+        layout.addWidget(browser, stretch=1)
+
+        close_btn = QPushButton("Close")
+        close_btn.setFixedWidth(100)
+        close_btn.clicked.connect(self.accept)
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        btn_row.addWidget(close_btn)
+        btn_row.addStretch()
+        layout.addLayout(btn_row)
+
+
 class _ConfigDialog(QDialog):
     """App-wide appearance settings (font size and color theme)."""
 
@@ -707,6 +894,11 @@ class MainWindow(QMainWindow):
         self._config_btn.setToolTip("Font size, color theme, recognition window settings")
         self._config_btn.clicked.connect(self._open_config_dialog)
         toolbar.addWidget(self._config_btn)
+        self._help_btn = QPushButton("?")
+        self._help_btn.setFixedWidth(34)
+        self._help_btn.setToolTip("Open user guide")
+        self._help_btn.clicked.connect(self._show_user_guide)
+        toolbar.addWidget(self._help_btn)
         self._cancel_btn = QPushButton("✕  Cancel")
         self._cancel_btn.setVisible(False)
         self._cancel_btn.setStyleSheet(
@@ -2604,6 +2796,9 @@ class MainWindow(QMainWindow):
             self._font_size  = dlg.selected_size()
             self._theme_name = dlg.selected_theme()
             self.setStyleSheet(_make_qss(self._font_size, self._theme_name))
+
+    def _show_user_guide(self):
+        _UserGuideDialog(parent=self).exec()
 
     # ------------------------------------------------------------------ run-settings helpers
 

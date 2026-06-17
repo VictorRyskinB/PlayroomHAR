@@ -607,18 +607,19 @@ class VideoPlayerWidget(QWidget):
                 ry = int(region["ny"] * h)
                 rw = int(region["nw"] * w)
                 rh = int(region["nh"] * h)
-                # Dashed border
-                pen = QPen(QColor(*color), 2, Qt.PenStyle.DashLine)
+                # Dashed border — thicker so it reads clearly on any background
+                pen = QPen(QColor(*color), 3, Qt.PenStyle.DashLine)
                 painter.setPen(pen)
                 painter.drawRect(rx, ry, rw, rh)
-                # Name tag
-                name     = region["name"]
-                tag_w    = len(name) * 7 + 8
-                tag_h    = 17
-                painter.fillRect(rx, ry, tag_w, tag_h, QColor(*color, 200))
+                # Name tag — font scales with video width
+                name      = region["name"]
+                font_pt   = max(14, w // 45)
+                tag_h     = font_pt + 10
+                tag_w     = len(name) * (font_pt - 2) + 14
+                painter.fillRect(rx, ry, tag_w, tag_h, QColor(*color, 220))
                 painter.setPen(QPen(Qt.GlobalColor.white))
-                painter.setFont(QFont("Arial", 9, QFont.Weight.Bold))
-                painter.drawText(rx + 4, ry + tag_h - 4, name)
+                painter.setFont(QFont("Arial", font_pt, QFont.Weight.Bold))
+                painter.drawText(rx + 6, ry + tag_h - 5, name)
 
         # ── YOLO bounding boxes ──
         if self._show_yolo:

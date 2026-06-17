@@ -53,6 +53,9 @@ class PathMapWidget(QWidget):
         self._path_points:  list[PathPoint] = []
         self._heatmap_rgba: np.ndarray | None = None   # shape (H, W, 4) uint8
         self._regions:      list[dict] = []            # {name, nx, ny, nw, nh}
+        self._homography:   np.ndarray | None = None   # 3×3 pixel→world matrix
+        self._video_fw:     int = 0
+        self._video_fh:     int = 0
 
         self._show_path    = True
         self._show_heatmap = True
@@ -82,12 +85,15 @@ class PathMapWidget(QWidget):
         self.update()
 
     def set_regions(self, regions: list[dict]):
-        """
-        Regions in normalised video coords — displayed on the floor map only
-        if a homography is available (passed separately to convert them).
-        For now, regions are stored for future use.
-        """
+        """Regions in normalised video coords. Drawn on the map if homography is set."""
         self._regions = regions
+        self.update()
+
+    def set_homography(self, matrix: np.ndarray | None, fw: int, fh: int):
+        """Pass the pixel→world homography so regions can be reprojected onto the map."""
+        self._homography = matrix
+        self._video_fw   = fw
+        self._video_fh   = fh
         self.update()
 
     def set_show_path(self, v: bool):
@@ -177,6 +183,10 @@ class PathMapWidget(QWidget):
         # ── Path layer ──
         if self._show_path and self._path_points:
             self._draw_path(painter, rx, ry, rw, rh)
+
+        # ── Region overlays ──
+        if self._show_regions and self._regions and self._homography is not None:
+            self._draw_regions(painter, rx, ry, rw, rh)
 
         # ── No-data message ──
         if not self._path_points:
@@ -277,6 +287,53 @@ class PathMapWidget(QWidget):
             painter.setPen(QPen(QColor("#ff4444"), 1))
             painter.setBrush(QBrush(QColor("#ff4444")))
             painter.drawEllipse(end, 5, 5)
+
+    def _draw_regions(
+        self,
+        painter: QPainter,
+        rx: float, ry: float, rw: float, rh: float,
+    ):
+        import cv2
+        _COLORS = [
+            (255, 100, 100), (100, 220, 100), (100, 140, 255), (255, 220, 50),
+            (255, 100, 220), ( 80, 220, 220), (255, 160,  40), (180, 100, 255),
+        ]
+        mat = self._homography
+        fw, fh = self._video_fw, self._video_fh
+        if fw == 0 or fh == 0:
+            return
+
+        dot_r     = max(6, int(rw / 30))   # dot radius scales with map size
+        font_size = max(9, int(rw / 28))
+        painter.setFont(QFont("Arial", font_size, QFont.Weight.Bold))
+
+        for idx, region in enumerate(self._regions):
+            color = QColor(*_COLORS[idx % len(_COLORS)])
+
+            # Project the bottom-center of the region (where feet stand)
+            cx_px = (region["nx"] + region["nw"] / 2) * fw
+            cy_px = (region["ny"] + region["nh"]) * fh
+            pt_w  = cv2.perspectiveTransform(
+                np.float32([[[cx_px, cy_px]]]), mat
+            )
+            x_cm, y_cm = float(pt_w[0][0][0]), float(pt_w[0][0][1])
+            wpt = self._world_to_widget(x_cm, y_cm, rx, ry, rw, rh)
+
+            # Skip points that fall outside the room rectangle
+            if not (rx <= wpt.x() <= rx + rw and ry <= wpt.y() <= ry + rh):
+                continue
+
+            # Filled circle
+            painter.setBrush(QBrush(color))
+            painter.setPen(QPen(Qt.GlobalColor.white, 1))
+            painter.drawEllipse(wpt, dot_r, dot_r)
+
+            # Name label to the right of the dot
+            painter.setPen(QPen(Qt.GlobalColor.white))
+            painter.drawText(
+                QPointF(wpt.x() + dot_r + 3, wpt.y() + font_size // 2),
+                region["name"]
+            )
 
     def _draw_heatmap(
         self,

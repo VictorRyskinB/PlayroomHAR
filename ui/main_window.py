@@ -1026,6 +1026,14 @@ class MainWindow(QMainWindow):
         )
         self._load_cal_btn.clicked.connect(self._load_cal_dialog)
 
+        self._path_show_regions_chk = QCheckBox("Regions")
+        self._path_show_regions_chk.setChecked(True)
+        self._path_show_regions_chk.setStyleSheet("font-size:11px;")
+        self._path_show_regions_chk.setToolTip(
+            "Show/hide the named region overlays on the floor map.\n"
+            "Requires camera calibration to reproject regions into world coordinates."
+        )
+
         self._path_live_chk = QCheckBox("Live path")
         self._path_live_chk.setChecked(False)
         self._path_live_chk.setStyleSheet("font-size:11px;")
@@ -1037,6 +1045,7 @@ class MainWindow(QMainWindow):
 
         _path_toggle_row.addWidget(self._path_show_path_chk)
         _path_toggle_row.addWidget(self._path_show_heatmap_chk)
+        _path_toggle_row.addWidget(self._path_show_regions_chk)
         _path_toggle_row.addWidget(self._path_live_chk)
         _path_toggle_row.addStretch()
         _path_toggle_row.addWidget(self._path_cal_status_lbl)
@@ -1064,6 +1073,9 @@ class MainWindow(QMainWindow):
         )
         self._path_show_heatmap_chk.stateChanged.connect(
             lambda s: self._path_map.set_show_heatmap(bool(s))
+        )
+        self._path_show_regions_chk.stateChanged.connect(
+            lambda s: self._path_map.set_show_regions(bool(s))
         )
         self._path_live_chk.stateChanged.connect(self._on_path_live_toggled)
 
@@ -1145,6 +1157,7 @@ class MainWindow(QMainWindow):
                 self._cal_pixel_pts     = hom_data.get("pixel_points", [])
                 self._cal_world_pts     = hom_data.get("world_points_cm", [])
                 self._path_map.set_room_size(*self._room_size_cm)
+                self._path_map.set_homography(hom_data["matrix"], self._video.frame_width, self._video.frame_height)
                 self._path_cal_status_lbl.setText(
                     f"Calibration loaded  ({self._room_size_cm[0]/100:.1f} m × "
                     f"{self._room_size_cm[1]/100:.1f} m)"
@@ -1365,6 +1378,7 @@ class MainWindow(QMainWindow):
         has = n > 0
         self._clear_regions_btn.setEnabled(has)
         self._save_regions_btn.setEnabled(has)
+        self._path_map.set_regions(self._regions)
         if save:
             self._autosave_regions()
 
@@ -1852,6 +1866,7 @@ class MainWindow(QMainWindow):
             self._homography_matrix = matrix
             self._room_size_cm      = tuple(room_size_cm)
             self._path_map.set_room_size(*room_size_cm)
+            self._path_map.set_homography(matrix, self._video.frame_width, self._video.frame_height)
             self._path_cal_status_lbl.setText(
                 f"Calibrated  ({room_size_cm[0]/100:.1f} m × "
                 f"{room_size_cm[1]/100:.1f} m)"
@@ -1918,6 +1933,7 @@ class MainWindow(QMainWindow):
             self._cal_pixel_pts     = data["pixel_points"]
             self._cal_world_pts     = data["world_points_cm"]
             self._path_map.set_room_size(*self._room_size_cm)
+            self._path_map.set_homography(data["matrix"], self._video.frame_width, self._video.frame_height)
             self._path_cal_status_lbl.setText(
                 f"Calibration loaded  ({self._room_size_cm[0]/100:.1f} m × "
                 f"{self._room_size_cm[1]/100:.1f} m)"

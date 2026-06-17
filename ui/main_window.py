@@ -12,29 +12,26 @@
 # overlay and the results table in real time.
 #
 # Workers:
-#   _YoloWorker         — YOLO-only pipeline (fast, for iteration)
-#   _FullAnalysisWorker — YOLO + MMAction2 pipeline (production)
-#   _MMAction2Worker    — MMAction2 only (skips YOLO; uses existing video)
+#   _YoloWorker         — YOLO-only pipeline
 
 from pathlib import Path
 
 from PyQt6.QtCore import Qt, QThread, QTimer, QSettings, pyqtSignal, QObject
-from PyQt6.QtGui import QAction, QColor
+from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QPushButton, QLabel, QSplitter, QStatusBar,
     QProgressBar, QCheckBox, QFrame, QSpinBox, QDoubleSpinBox,
-    QFileDialog, QInputDialog, QTabWidget, QComboBox, QLineEdit, QMenu,
+    QFileDialog, QInputDialog, QTabWidget, QComboBox, QLineEdit,
     QDialog, QDialogButtonBox, QFormLayout, QMessageBox,
-    QListWidget, QListWidgetItem, QScrollArea,
+    QScrollArea,
     QButtonGroup, QRadioButton,
     QStackedWidget, QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
     QGridLayout, QSizePolicy,
 )
 
 from ui.video_player import VideoPlayerWidget
-from ui.results_table import ResultsTableWidget, GenericTableWidget
-from mock_data import MOCK_BOUNDING_BOXES, MOCK_RESULTS
+from ui.results_table import GenericTableWidget
 
 
 # ---------------------------------------------------------------------------
@@ -224,14 +221,12 @@ def _make_qss(font_pt: int, theme_name: str) -> str:
 # ---------------------------------------------------------------------------
 
 class _ConfigDialog(QDialog):
-    """App-wide appearance and MMAction2 recognition window settings."""
+    """App-wide appearance settings (font size and color theme)."""
 
     def __init__(
         self,
         current_size: int,
         current_theme: str,
-        current_clip_len: int,
-        current_clip_stride: int,
         parent=None,
     ):
         super().__init__(parent)
@@ -273,48 +268,6 @@ class _ConfigDialog(QDialog):
                 rb.setChecked(True)
         vbox.addLayout(theme_row)
 
-        # ── Recognition window ──
-        win_lbl = QLabel("Recognition window  (MMAction2)")
-        win_lbl.setStyleSheet("font-weight: bold;")
-        vbox.addWidget(win_lbl)
-
-        hint = QLabel(
-            "The model reads a sliding window of frames to predict each action.\n"
-            "Window: frames per prediction.  Step: how far to advance each time.\n"
-            "Example — window 32 / step 16 at 30 fps:\n"
-            "  → a prediction every 0.5 s, each covering ~1.1 s of video.\n"
-            "Smaller step = more predictions but slower run.\n"
-            "Smaller window = faster but may miss slow or sustained actions."
-        )
-        hint.setStyleSheet("color: #8899aa; font-size: 10pt;")
-        hint.setWordWrap(True)
-        vbox.addWidget(hint)
-
-        form = QFormLayout()
-        form.setSpacing(8)
-
-        self._clip_len_spin = QSpinBox()
-        self._clip_len_spin.setRange(8, 128)
-        self._clip_len_spin.setSingleStep(8)
-        self._clip_len_spin.setValue(current_clip_len)
-        self._clip_len_spin.setToolTip(
-            "How many video frames the model analyses per prediction.\n"
-            "Larger = more temporal context, slower inference."
-        )
-        form.addRow("Window (frames):", self._clip_len_spin)
-
-        self._clip_stride_spin = QSpinBox()
-        self._clip_stride_spin.setRange(1, 64)
-        self._clip_stride_spin.setSingleStep(4)
-        self._clip_stride_spin.setValue(current_clip_stride)
-        self._clip_stride_spin.setToolTip(
-            "How far to advance the window between predictions.\n"
-            "Step = window → no overlap (fastest).\n"
-            "Step = window / 2 → 50 % overlap (more thorough)."
-        )
-        form.addRow("Step (frames):", self._clip_stride_spin)
-        vbox.addLayout(form)
-
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok |
             QDialogButtonBox.StandardButton.Cancel
@@ -330,195 +283,6 @@ class _ConfigDialog(QDialog):
     def selected_theme(self) -> str:
         btn = self._theme_group.checkedButton()
         return btn.text() if btn else "Dark Blue"
-
-    def clip_len(self) -> int:
-        return self._clip_len_spin.value()
-
-    def clip_stride(self) -> int:
-        return self._clip_stride_spin.value()
-
-
-# ---------------------------------------------------------------------------
-# Interaction filter dialog  (non-modal; covers subjects AND object labels)
-# ---------------------------------------------------------------------------
-
-_LIST_STYLE = (
-    "QListWidget { background:#1a1a30; border: 1px solid #2e2e4e; }"
-    "QListWidget::item { color:#dde; padding: 3px; }"
-    "QListWidget::item:alternate { background:#1e1e38; }"
-)
-
-def _make_list_widget() -> "QListWidget":
-    w = QListWidget()
-    w.setAlternatingRowColors(True)
-    w.setStyleSheet(_LIST_STYLE)
-    return w
-
-def _populate_list(
-    lst: "QListWidget",
-    items: list[str],
-    excluded: set[str],
-) -> None:
-    """Fill *lst* with checkable items; items in *excluded* are unchecked."""
-    for label in sorted(items):
-        item = QListWidgetItem(label)
-        item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-        item.setCheckState(
-            Qt.CheckState.Unchecked if label in excluded else Qt.CheckState.Checked
-        )
-        lst.addItem(item)
-    rows = min(lst.count(), 12)
-    lst.setFixedHeight(max(60, rows * 24 + 8))
-
-def _get_excluded(lst: "QListWidget") -> set[str]:
-    return {
-        lst.item(i).text()
-        for i in range(lst.count())
-        if lst.item(i).checkState() == Qt.CheckState.Unchecked
-    }
-
-def _set_excluded_silent(lst: "QListWidget", excluded: set[str]) -> None:
-    lst.itemChanged.disconnect()   # caller re-connects after
-    for i in range(lst.count()):
-        item = lst.item(i)
-        item.setCheckState(
-            Qt.CheckState.Unchecked if item.text() in excluded
-            else Qt.CheckState.Checked
-        )
-
-
-class _InteractionFilterDialog(QDialog):
-    """
-    Non-modal filter window for the Object Interactions tab.
-
-    Top section  — Subject types  (person / hand / foot / …)
-                   Only shows subjects actually detected in the current run.
-    Bottom section — Object labels (ball / table / crayon / …)
-                   One checkbox per unique detected non-subject label.
-
-    Callback on_change(excluded_subjects: set[str], excluded_labels: set[str])
-    is called whenever any checkbox changes.
-    """
-
-    def __init__(
-        self,
-        all_subjects: list[str],
-        all_labels:   list[str],
-        excl_subjects: set[str],
-        excl_labels:   set[str],
-        on_change,
-        parent=None,
-    ):
-        super().__init__(parent)
-        self.setWindowTitle("Interaction Filter")
-        self.setWindowFlags(
-            Qt.WindowType.Window | Qt.WindowType.WindowCloseButtonHint
-        )
-        self.setMinimumWidth(300)
-        self._on_change = on_change
-
-        vbox = QVBoxLayout(self)
-        vbox.setSpacing(8)
-
-        # ── Subject section ──
-        subj_lbl = QLabel("Subject types")
-        subj_lbl.setStyleSheet("font-size:11px; font-weight:bold; color:#99ccbb;")
-        vbox.addWidget(subj_lbl)
-
-        hint_s = QLabel(
-            "Person = broad proximity.  Hand/Foot = specific contact.\n"
-            "Subject↔Subject interactions (e.g. person↔hand) are never shown."
-        )
-        hint_s.setStyleSheet("font-size:10px; color:#8899aa;")
-        hint_s.setWordWrap(True)
-        vbox.addWidget(hint_s)
-
-        self._subj_list = _make_list_widget()
-        _populate_list(self._subj_list, all_subjects, excl_subjects)
-        self._subj_list.itemChanged.connect(self._changed)
-        vbox.addWidget(self._subj_list)
-
-        # ── Divider ──
-        line = QFrame()
-        line.setFrameShape(QFrame.Shape.HLine)
-        line.setStyleSheet("color: #2e2e4e;")
-        vbox.addWidget(line)
-
-        # ── Object label section ──
-        obj_lbl = QLabel("Object labels")
-        obj_lbl.setStyleSheet("font-size:11px; font-weight:bold; color:#99aacc;")
-        vbox.addWidget(obj_lbl)
-
-        hint_o = QLabel("Uncheck a label to hide all interactions with that object.")
-        hint_o.setStyleSheet("font-size:10px; color:#8899aa;")
-        hint_o.setWordWrap(True)
-        vbox.addWidget(hint_o)
-
-        self._obj_list = _make_list_widget()
-        _populate_list(self._obj_list, all_labels, excl_labels)
-        self._obj_list.itemChanged.connect(self._changed)
-        vbox.addWidget(self._obj_list)
-
-        btn_row = QHBoxLayout()
-        show_btn = QPushButton("Show All")
-        show_btn.clicked.connect(self._show_all)
-        hide_btn = QPushButton("Hide All Objects")
-        hide_btn.clicked.connect(self._hide_all_objects)
-        btn_row.addWidget(show_btn)
-        btn_row.addWidget(hide_btn)
-        vbox.addLayout(btn_row)
-
-        self.adjustSize()
-
-    # ------------------------------------------------------------------ public
-
-    def populate(
-        self,
-        all_subjects: list[str],
-        all_labels:   list[str],
-        excl_subjects: set[str],
-        excl_labels:   set[str],
-    ):
-        """Rebuild both lists (call after a new YOLO run)."""
-        for lst in (self._subj_list, self._obj_list):
-            lst.itemChanged.disconnect(self._changed)
-            lst.clear()
-        _populate_list(self._subj_list, all_subjects, excl_subjects)
-        _populate_list(self._obj_list,  all_labels,   excl_labels)
-        for lst in (self._subj_list, self._obj_list):
-            lst.itemChanged.connect(self._changed)
-        self.adjustSize()
-
-    def set_excluded_labels(self, excluded: set[str]):
-        """Push updated label exclusions without triggering the callback."""
-        _set_excluded_silent(self._obj_list, excluded)
-        self._obj_list.itemChanged.connect(self._changed)
-
-    def get_excluded_subjects(self) -> set[str]:
-        return _get_excluded(self._subj_list)
-
-    def get_excluded_labels(self) -> set[str]:
-        return _get_excluded(self._obj_list)
-
-    # ------------------------------------------------------------------ private
-
-    def _changed(self, _item=None):
-        self._on_change(self.get_excluded_subjects(), self.get_excluded_labels())
-
-    def _show_all(self):
-        for lst in (self._subj_list, self._obj_list):
-            lst.itemChanged.disconnect(self._changed)
-            for i in range(lst.count()):
-                lst.item(i).setCheckState(Qt.CheckState.Checked)
-            lst.itemChanged.connect(self._changed)
-        self._changed()
-
-    def _hide_all_objects(self):
-        self._obj_list.itemChanged.disconnect(self._changed)
-        for i in range(self._obj_list.count()):
-            self._obj_list.item(i).setCheckState(Qt.CheckState.Unchecked)
-        self._obj_list.itemChanged.connect(self._changed)
-        self._changed()
 
 
 # ---------------------------------------------------------------------------
@@ -622,22 +386,20 @@ class _YoloWorker(QObject):
                  fps: float = 30.0, total_frames: int = 0,
                  yolo_model: str = "yolov8n.pt",
                  world_classes: list | None = None,
-                 enabled_mm_models: list | None = None,
                  yolo_run_settings: dict | None = None):
         super().__init__()
-        self._path             = video_path
-        self._fw               = frame_w
-        self._fh               = frame_h
-        self._stride           = frame_stride
-        self._all_classes      = detect_all_classes
-        self._display_conf     = display_conf
-        self._fps              = fps
-        self._total_frames     = total_frames
-        self._yolo_model       = yolo_model
-        self._world_classes    = world_classes
-        self._enabled_mm       = enabled_mm_models   # unused in YOLO-only, kept for symmetry
+        self._path              = video_path
+        self._fw                = frame_w
+        self._fh                = frame_h
+        self._stride            = frame_stride
+        self._all_classes       = detect_all_classes
+        self._display_conf      = display_conf
+        self._fps               = fps
+        self._total_frames      = total_frames
+        self._yolo_model        = yolo_model
+        self._world_classes     = world_classes
         self._yolo_run_settings = yolo_run_settings
-        self._cancelled        = False
+        self._cancelled         = False
 
     def cancel(self):
         self._cancelled = True
@@ -660,7 +422,7 @@ class _YoloWorker(QObject):
             allowed  = None if (self._all_classes or is_world) else DEFAULT_CLASSES
 
             # ── Phase 1: YOLO at capture floor ──
-            self.status.emit("Phase 1/3 — YOLO detection…")
+            self.status.emit("Phase 1/2 — YOLO detection…")
             detector = YoloDetector(
                 model_name=self._yolo_model,
                 frame_stride=self._stride,
@@ -679,7 +441,7 @@ class _YoloWorker(QObject):
             n_objects = sum(1 for f in raw_frames
                             if any(d.label != "person" for d in f.detections))
             self.status.emit(
-                f"Phase 2/3 — Mapping interactions…  "
+                f"Phase 2/2 — Building segments…  "
                 f"({n_person}/{n_frames} frames with person, "
                 f"{n_objects} frames with objects)"
             )
@@ -687,10 +449,6 @@ class _YoloWorker(QObject):
             filtered = _filter_frames(raw_frames, self._display_conf)
             mapped   = InteractionMapper().map(filtered)
             n_inter  = sum(1 for mf in mapped if mf.interacting_objects())
-            self.status.emit(
-                f"Phase 3/3 — Building segments…  "
-                f"({n_inter}/{n_frames} frames with interactions)"
-            )
             segs, _ = SegmentBuilder(self._fw, self._fh).build(mapped)
 
             _save_results_quietly(
@@ -704,8 +462,6 @@ class _YoloWorker(QObject):
                 stride=self._stride,
                 display_conf=self._display_conf,
                 all_classes=self._all_classes,
-                mmaction2_used=False,
-                action_clips=[],
                 yolo_run_settings=self._yolo_run_settings,
             )
 
@@ -721,206 +477,6 @@ class _YoloWorker(QObject):
         except _WorkerCancelled:
             self.status.emit("Cancelled.")
             self.finished.emit([], [], "Cancelled")
-        except Exception as exc:
-            import traceback; traceback.print_exc()
-            self.error.emit(str(exc))
-
-
-# ---------------------------------------------------------------------------
-# Worker: YOLO + MMAction2
-# ---------------------------------------------------------------------------
-
-class _FullAnalysisWorker(QObject):
-    progress = pyqtSignal(int)
-    status   = pyqtSignal(str)
-    finished = pyqtSignal(object, object, str)   # (raw_frames, action_clips, diag)
-    error    = pyqtSignal(str)
-
-    def __init__(self, video_path: str, frame_w: int, frame_h: int,
-                 frame_stride: int = 1, detect_all_classes: bool = False,
-                 display_conf: float = 0.25,
-                 fps: float = 30.0, total_frames: int = 0,
-                 yolo_model: str = "yolov8n.pt",
-                 world_classes: list | None = None,
-                 enabled_mm_models: list | None = None,
-                 yolo_run_settings: dict | None = None):
-        super().__init__()
-        self._path              = video_path
-        self._fw                = frame_w
-        self._fh                = frame_h
-        self._stride            = frame_stride
-        self._all_classes       = detect_all_classes
-        self._display_conf      = display_conf
-        self._fps               = fps
-        self._total_frames      = total_frames
-        self._yolo_model        = yolo_model
-        self._world_classes     = world_classes
-        self._enabled_mm        = enabled_mm_models
-        self._yolo_run_settings = yolo_run_settings
-        self._cancelled         = False
-
-    def cancel(self):
-        self._cancelled = True
-
-    def _progress_yolo(self, pct: int):
-        if self._cancelled:
-            raise _WorkerCancelled()
-        self.progress.emit(pct // 2)
-
-    def _progress_mm(self, pct: int):
-        if self._cancelled:
-            raise _WorkerCancelled()
-        self.progress.emit(50 + pct * 40 // 100)
-
-    def run(self):
-        try:
-            from backend.yolo_detector import (
-                YoloDetector, DEFAULT_CLASSES, CAPTURE_CONF_FLOOR,
-            )
-            from backend.interaction_mapper import InteractionMapper
-            from backend.segment_builder    import SegmentBuilder
-            from backend.action_recognizer  import ActionRecognizer
-
-            is_world = "world" in self._yolo_model.lower()
-            allowed  = None if (self._all_classes or is_world) else DEFAULT_CLASSES
-
-            # ── Phase 1: YOLO  (0 → 50 %) ──
-            self.status.emit("Phase 1/3 — YOLO detection…")
-            detector = YoloDetector(
-                model_name=self._yolo_model,
-                frame_stride=self._stride,
-                allowed_classes=allowed,
-                conf_threshold=CAPTURE_CONF_FLOOR,
-                world_classes=self._world_classes,
-            )
-            raw_frames = detector.run(
-                self._path,
-                progress_cb=self._progress_yolo,
-            )
-
-            n_frames  = len(raw_frames)
-            n_person  = sum(1 for f in raw_frames
-                            if any(d.label == "person" for d in f.detections))
-            n_objects = sum(1 for f in raw_frames
-                            if any(d.label != "person" for d in f.detections))
-
-            filtered = _filter_frames(raw_frames, self._display_conf)
-            self.status.emit(
-                f"Phase 2/3 — MMAction2 action recognition…  "
-                f"({n_person}/{n_frames} frames with person)"
-            )
-            mapped = InteractionMapper().map(filtered)
-            n_inter = sum(1 for mf in mapped if mf.interacting_objects())
-
-            # ── Phase 2: MMAction2  (50 → 90 %) ──
-            recognizer     = ActionRecognizer(
-                conf_threshold=0.0,
-                enabled_models=self._enabled_mm,
-            )
-            action_clips   = []
-            mmaction2_used = False
-            if recognizer.is_available():
-                action_clips = recognizer.recognize(
-                    self._path,
-                    progress_cb=self._progress_mm,
-                )
-                mmaction2_used = bool(action_clips)
-            else:
-                self.status.emit(
-                    f"Phase 2/3 — MMAction2 unavailable, using YOLO labels…  "
-                    f"({n_inter}/{n_frames} interaction frames)"
-                )
-
-            # ── Phase 3: build + save  (90 → 100 %) ──
-            self.status.emit("Phase 3/3 — Building segments…")
-            self.progress.emit(90)
-            segs, _ = SegmentBuilder(self._fw, self._fh).build(
-                mapped, action_clips=action_clips
-            )
-
-            _save_results_quietly(
-                video_path=self._path,
-                segments=segs,
-                raw_frames=raw_frames,
-                fps=self._fps,
-                frame_w=self._fw,
-                frame_h=self._fh,
-                total_frames=self._total_frames,
-                stride=self._stride,
-                display_conf=self._display_conf,
-                all_classes=self._all_classes,
-                mmaction2_used=mmaction2_used,
-                action_clips=action_clips,
-                yolo_run_settings=self._yolo_run_settings,
-            )
-
-            diag = (
-                f"YOLO: {n_frames} frames  |  "
-                f"Person: {n_person}  |  "
-                f"Objects: {n_objects}  |  "
-                f"Interaction frames (@{self._display_conf:.2f}): {n_inter}"
-            )
-            self.progress.emit(100)
-            self.finished.emit(raw_frames, action_clips, diag)
-
-        except _WorkerCancelled:
-            self.status.emit("Cancelled.")
-            self.finished.emit([], [], "Cancelled")
-        except Exception as exc:
-            import traceback; traceback.print_exc()
-            self.error.emit(str(exc))
-
-
-# ---------------------------------------------------------------------------
-# Worker: MMAction2 only (no YOLO)
-# ---------------------------------------------------------------------------
-
-class _MMAction2Worker(QObject):
-    progress = pyqtSignal(int)
-    status   = pyqtSignal(str)
-    finished = pyqtSignal(object, str)   # (action_clips, diagnostic)
-    error    = pyqtSignal(str)
-
-    def __init__(self, video_path: str, enabled_models: list | None = None):
-        super().__init__()
-        self._path         = video_path
-        self._enabled_mm   = enabled_models
-        self._cancelled    = False
-
-    def cancel(self):
-        self._cancelled = True
-
-    def _progress_cb(self, pct: int):
-        if self._cancelled:
-            raise _WorkerCancelled()
-        self.progress.emit(pct)
-
-    def run(self):
-        try:
-            from backend.action_recognizer import ActionRecognizer
-
-            recognizer = ActionRecognizer(
-                conf_threshold=0.0,
-                enabled_models=self._enabled_mm,
-            )
-            if not recognizer.is_available():
-                self.error.emit(
-                    f"MMAction2 is not available: {recognizer.unavailable_reason()}"
-                )
-                return
-
-            self.status.emit("MMAction2 — running action recognition…")
-            action_clips = recognizer.recognize(
-                self._path,
-                progress_cb=self._progress_cb,
-            )
-            diag = f"MMAction2: {len(action_clips)} clips captured from {self._path}"
-            self.progress.emit(100)
-            self.finished.emit(action_clips, diag)
-
-        except _WorkerCancelled:
-            self.status.emit("Cancelled.")
-            self.finished.emit([], "Cancelled")
         except Exception as exc:
             import traceback; traceback.print_exc()
             self.error.emit(str(exc))
@@ -1005,28 +561,15 @@ class MainWindow(QMainWindow):
         self.resize(1320, 860)
         self._video_path: str | None = None
         self._worker_thread: QThread | None = None
-        self._result_time_ranges: list = []
         self._region_time_ranges: list = []
-        self._action_time_ranges: list = []
 
         # Raw FrameDetections cached for live refilter
         self._raw_frames: list | None = None
-        # ALL MMAction2 clips (unfiltered) — UI applies threshold live
-        self._action_clips: list = []
         # Named spatial regions
         self._regions: list[dict] = []
         # YOLO-World custom class list
         from backend.yolo_classes_config import DEFAULT_PLAYROOM_CLASSES
         self._world_classes: list[str] = list(DEFAULT_PLAYROOM_CLASSES)
-
-        # Interaction filter (Object Interactions tab)
-        self._label_filter_excluded:   set[str] = set()   # excluded object labels
-        self._subject_filter_excluded: set[str] = set()   # excluded subject types
-        self._label_filter_dlg: "_InteractionFilterDialog | None" = None
-
-        # Subject labels: which detected classes are treated as subjects
-        # (always includes "person"; add "hand"/"foot" via YOLO-World bar)
-        self._subject_labels: set[str] = {"person"}
 
         # Path tracking state
         self._path_points: list = []          # list[PathPoint]
@@ -1052,11 +595,9 @@ class MainWindow(QMainWindow):
         self._hl_src_row: int = -1      # source-model row index
         self._last_position_ms: int = 0 # last known video position (live path)
 
-        # Appearance / recognition-window settings (persisted via QSettings)
-        self._font_size: int          = 12
-        self._theme_name: str         = "Dark Blue"
-        self._clip_len_frames: int    = 32
-        self._clip_stride_frames: int = 16
+        # Appearance settings (persisted via QSettings)
+        self._font_size: int  = 12
+        self._theme_name: str = "Dark Blue"
 
         # Analysis panel state
         self._analysis_smooth_window: int   = 5     # smoothing window (frames)
@@ -1066,6 +607,9 @@ class MainWindow(QMainWindow):
         self._analysis_reg_stats:     list  = []    # cached list[RegionStats]
         self._analysis_speed_s:       list  = []    # cached list[SpeedSample]
 
+        # "Run All" chaining flag — when True, YOLO completion auto-launches Track Path
+        self._run_all_mode: bool = False
+
         # Debounce timer — refilter fires 250 ms after the last slider change
         self._refilter_timer = QTimer(self)
         self._refilter_timer.setSingleShot(True)
@@ -1073,7 +617,6 @@ class MainWindow(QMainWindow):
         self._refilter_timer.timeout.connect(self._refilter)
 
         self._build_ui()
-        self._show_mmaction2_banner()
         self._load_settings()
         # Re-apply stylesheet so saved font/theme preferences take effect on startup
         self.setStyleSheet(_make_qss(self._font_size, self._theme_name))
@@ -1089,17 +632,6 @@ class MainWindow(QMainWindow):
         root.setContentsMargins(8, 8, 8, 4)
         root.setSpacing(0)
 
-        # ── MMAction2 availability banner ──
-        self._banner = QFrame()
-        self._banner.setObjectName("banner")
-        bl = QHBoxLayout(self._banner)
-        bl.setContentsMargins(8, 4, 8, 4)
-        self._banner_label = QLabel()
-        self._banner_label.setStyleSheet("color:#ffbb55; font-size:11px;")
-        self._banner_label.setWordWrap(True)
-        bl.addWidget(self._banner_label)
-        root.addWidget(self._banner)
-
         # ── Toolbar row 1: title + action buttons ──
         toolbar = QHBoxLayout()
         toolbar.setContentsMargins(0, 4, 0, 4)
@@ -1108,31 +640,10 @@ class MainWindow(QMainWindow):
         app_title = QLabel("Playroom Action Annotator")
         app_title.setStyleSheet("font-size:14px; font-weight:bold; color:#aad;")
 
-        self._mock_toggle  = QCheckBox("Mock data")
-        self._mock_toggle.setChecked(False)
-        self._mock_toggle.stateChanged.connect(self._on_mock_toggled)
-
-        self._debug_toggle = QCheckBox("Debug cols")
-        self._debug_toggle.setChecked(False)
-        self._debug_toggle.stateChanged.connect(self._on_debug_toggled)
-
         self._yolo_btn = QPushButton("Run YOLO")
         self._yolo_btn.setEnabled(False)
         self._yolo_btn.setToolTip("YOLO detection only")
         self._yolo_btn.clicked.connect(self._run_yolo)
-
-        self._full_btn = QPushButton("Run Full Analysis")
-        self._full_btn.setEnabled(False)
-        self._full_btn.setToolTip("YOLO + MMAction2")
-        self._full_btn.clicked.connect(self._run_full)
-
-        self._mmaction2_btn = QPushButton("Run MMAction2")
-        self._mmaction2_btn.setEnabled(False)
-        self._mmaction2_btn.setToolTip(
-            "Run MMAction2 action recognition only (no YOLO).\n"
-            "Useful for testing action labels without re-running detection."
-        )
-        self._mmaction2_btn.clicked.connect(self._run_mmaction2)
 
         self._track_path_btn = QPushButton("Track Path")
         self._track_path_btn.setEnabled(False)
@@ -1165,12 +676,17 @@ class MainWindow(QMainWindow):
 
         toolbar.addWidget(app_title)
         toolbar.addStretch()
-        toolbar.addWidget(self._mock_toggle)
-        toolbar.addWidget(self._debug_toggle)
+        self._run_all_btn = QPushButton("▶▶  Run All")
+        self._run_all_btn.setEnabled(False)
+        self._run_all_btn.setToolTip(
+            "Run YOLO detection, then immediately run Track Path.\n"
+            "Equivalent to clicking Run YOLO → Track Path in sequence."
+        )
+        self._run_all_btn.clicked.connect(self._run_all)
+
         toolbar.addSpacing(8)
+        toolbar.addWidget(self._run_all_btn)
         toolbar.addWidget(self._yolo_btn)
-        toolbar.addWidget(self._full_btn)
-        toolbar.addWidget(self._mmaction2_btn)
         toolbar.addWidget(self._track_path_btn)
         toolbar.addWidget(self._calibrate_btn)
         toolbar.addWidget(self._load_json_btn)
@@ -1248,18 +764,6 @@ class MainWindow(QMainWindow):
         )
         self._conf_spin.valueChanged.connect(self._schedule_refilter)
 
-        self._prox_spin = QSpinBox()
-        self._prox_spin.setRange(20, 500)
-        self._prox_spin.setSingleStep(10)
-        self._prox_spin.setValue(150)
-        self._prox_spin.setFixedWidth(62)
-        self._prox_spin.setToolTip(
-            "Proximity threshold in pixels — LIVE.\n"
-            "Objects within this edge-to-edge distance of the child\n"
-            "are counted as interactions even without overlap."
-        )
-        self._prox_spin.valueChanged.connect(self._schedule_refilter)
-
         self._min_dur_spin = QDoubleSpinBox()
         self._min_dur_spin.setRange(0.1, 10.0)
         self._min_dur_spin.setSingleStep(0.1)
@@ -1271,30 +775,11 @@ class MainWindow(QMainWindow):
         )
         self._min_dur_spin.valueChanged.connect(self._schedule_refilter)
 
-        self._mmaction2_conf_spin = QDoubleSpinBox()
-        self._mmaction2_conf_spin.setRange(0.05, 0.95)
-        self._mmaction2_conf_spin.setSingleStep(0.05)
-        self._mmaction2_conf_spin.setValue(0.50)
-        self._mmaction2_conf_spin.setDecimals(2)
-        self._mmaction2_conf_spin.setFixedWidth(62)
-        self._mmaction2_conf_spin.setToolTip(
-            "MMAction2 action confidence threshold — LIVE.\n"
-            "All action clips are stored; only clips ≥ this value are shown."
-        )
-        self._mmaction2_conf_spin.valueChanged.connect(self._schedule_refilter)
-
         self._yolo_vis_chk = QCheckBox("YOLO boxes")
         self._yolo_vis_chk.setChecked(True)
         self._yolo_vis_chk.setStyleSheet("font-size:11px;")
         self._yolo_vis_chk.stateChanged.connect(
             lambda s: self._video.set_yolo_visible(bool(s))
-        )
-
-        self._action_vis_chk = QCheckBox("Action labels")
-        self._action_vis_chk.setChecked(True)
-        self._action_vis_chk.setStyleSheet("font-size:11px;")
-        self._action_vis_chk.stateChanged.connect(
-            lambda s: self._video.set_mmaction2_visible(bool(s))
         )
 
         self._trail_vis_chk = QCheckBox("Trail")
@@ -1317,19 +802,11 @@ class MainWindow(QMainWindow):
         parambar.addWidget(_param_label("YOLO conf ≥"))
         parambar.addWidget(self._conf_spin)
         parambar.addSpacing(8)
-        parambar.addWidget(_param_label("Action conf ≥"))
-        parambar.addWidget(self._mmaction2_conf_spin)
-        parambar.addSpacing(8)
-        parambar.addWidget(_param_label("Proximity ≤"))
-        parambar.addWidget(self._prox_spin)
-        parambar.addWidget(_param_label("px"))
-        parambar.addSpacing(8)
         parambar.addWidget(_param_label("Min duration ≥"))
         parambar.addWidget(self._min_dur_spin)
         parambar.addWidget(_param_label("s"))
         parambar.addSpacing(12)
         parambar.addWidget(self._yolo_vis_chk)
-        parambar.addWidget(self._action_vis_chk)
         parambar.addWidget(self._trail_vis_chk)
         parambar.addStretch()
         root.addWidget(parambar_frame)
@@ -1363,60 +840,8 @@ class MainWindow(QMainWindow):
             self._on_yolo_model_changed
         )
 
-        # ── MMAction2 model checkable dropdown ──
-        from backend.action_recognizer import _CANDIDATE_MODELS as _MM_MODELS
-        self._mmaction2_model_btn = QPushButton()
-        self._mmaction2_model_btn.setFixedWidth(200)
-        self._mmaction2_model_btn.setToolTip(
-            "Choose which MMAction2 model(s) to try.\n"
-            "Models are tried top-to-bottom; the first one that loads is used.\n"
-            "Future: ensemble mode (both run, highest confidence wins)."
-        )
-        mm_menu = QMenu(self._mmaction2_model_btn)
-        self._mm_model_actions: list[QAction] = []
-        for m in _MM_MODELS:
-            act = QAction(f"{m['name']}  —  {m['desc']}", mm_menu)
-            act.setCheckable(True)
-            act.setChecked(True)
-            act.setData(m["dataset"])
-            act.changed.connect(self._update_mmaction2_btn_label)
-            mm_menu.addAction(act)
-            self._mm_model_actions.append(act)
-        self._mmaction2_model_btn.setMenu(mm_menu)
-        self._update_mmaction2_btn_label()   # set initial label
-
         modelbar.addWidget(_model_label("YOLO model:"))
         modelbar.addWidget(self._yolo_model_combo)
-        modelbar.addSpacing(24)
-        modelbar.addWidget(_model_label("MMAction2 model:"))
-        modelbar.addWidget(self._mmaction2_model_btn)
-        modelbar.addSpacing(24)
-
-        self._action_merge_chk = QCheckBox("Merge clips")
-        self._action_merge_chk.setChecked(False)
-        self._action_merge_chk.setStyleSheet("font-size:11px;")
-        self._action_merge_chk.setToolTip(
-            "Merge consecutive action clips with the same label\n"
-            "if the gap between them is within the threshold below.\n"
-            "Useful to collapse repeated same-action windows into one segment."
-        )
-        self._action_merge_chk.stateChanged.connect(self._schedule_refilter)
-
-        self._action_merge_gap_spin = QSpinBox()
-        self._action_merge_gap_spin.setRange(0, 5000)
-        self._action_merge_gap_spin.setSingleStep(100)
-        self._action_merge_gap_spin.setValue(500)
-        self._action_merge_gap_spin.setFixedWidth(62)
-        self._action_merge_gap_spin.setToolTip(
-            "Maximum gap (ms) between two same-label clips\n"
-            "for them to be merged into one.  0 = only merge overlapping clips."
-        )
-        self._action_merge_gap_spin.valueChanged.connect(self._schedule_refilter)
-
-        modelbar.addWidget(self._action_merge_chk)
-        modelbar.addWidget(_model_label("gap ≤"))
-        modelbar.addWidget(self._action_merge_gap_spin)
-        modelbar.addWidget(_model_label("ms"))
         modelbar.addStretch()
         root.addWidget(modelbar_frame)
 
@@ -1448,27 +873,8 @@ class MainWindow(QMainWindow):
         self._load_classes_btn = QPushButton("Load Classes…")
         self._load_classes_btn.clicked.connect(self._load_classes_dialog)
 
-        subj_lbl = QLabel("Subject classes:")
-        subj_lbl.setStyleSheet("font-size:11px; color:#bbcc88;")
-
-        self._subject_classes_edit = QLineEdit()
-        self._subject_classes_edit.setPlaceholderText(
-            "e.g.  hand, foot  (always includes person)"
-        )
-        self._subject_classes_edit.setToolTip(
-            "Comma-separated YOLO-World labels to treat as SUBJECTS.\n"
-            "Subjects interact WITH objects — subject↔subject pairs are ignored.\n"
-            "'person' is always a subject.  Add 'hand', 'foot' here if detected.\n"
-            "These labels are also automatically added to the detection class list."
-        )
-        self._subject_classes_edit.setFixedWidth(260)
-        self._subject_classes_edit.textChanged.connect(self._on_subject_classes_changed)
-
         world_layout.addWidget(world_lbl)
         world_layout.addWidget(self._world_classes_edit, stretch=1)
-        world_layout.addSpacing(16)
-        world_layout.addWidget(subj_lbl)
-        world_layout.addWidget(self._subject_classes_edit)
         world_layout.addWidget(self._save_classes_btn)
         world_layout.addWidget(self._load_classes_btn)
         self._world_frame.setVisible(False)   # hidden until YOLO-World selected
@@ -1558,42 +964,21 @@ class MainWindow(QMainWindow):
         self._video.region_drawn.connect(self._on_region_drawn)
         self._video.calibration_click.connect(self._on_calibration_click)
 
-        # ── Three-tab results panel ──
+        # ── Two-tab results panel ──
         self._tabs = QTabWidget()
 
-        # Tab 0 — YOLO Object Interactions (existing schema)
-        self._results = ResultsTableWidget()
-        self._results.filter_btn_clicked.connect(self._open_label_filter)
-        self._results.hide_label_requested.connect(self._hide_label)
-        self._results._table.clicked.connect(
-            lambda idx: self._on_table_row_clicked(idx, 0,
-                self._results._proxy, self._result_time_ranges)
-        )
-        self._tabs.addTab(self._results, "Object Interactions")
-
-        # Tab 1 — Region Presence
+        # Tab 0 — Region Presence
         self._region_table = GenericTableWidget(
             ["Start", "End", "Duration", "Region", "Frames"],
             stretch_col=3,
         )
         self._region_table._table.clicked.connect(
-            lambda idx: self._on_table_row_clicked(idx, 1,
+            lambda idx: self._on_table_row_clicked(idx, 0,
                 self._region_table._proxy, self._region_time_ranges)
         )
         self._tabs.addTab(self._region_table, "Regions")
 
-        # Tab 2 — MMAction2 Action Clips
-        self._action_table = GenericTableWidget(
-            ["Start", "End", "Duration", "Action", "Confidence", "Model"],
-            stretch_col=3,
-        )
-        self._action_table._table.clicked.connect(
-            lambda idx: self._on_table_row_clicked(idx, 2,
-                self._action_table._proxy, self._action_time_ranges)
-        )
-        self._tabs.addTab(self._action_table, "Actions (MMAction2)")
-
-        # Tab 3 — Path & Heatmap
+        # Tab 1 — Path & Heatmap
         from ui.path_map_widget import PathMapWidget
         _path_tab_container = QWidget()
         _path_tab_layout    = QVBoxLayout(_path_tab_container)
@@ -1679,7 +1064,7 @@ class MainWindow(QMainWindow):
         )
         self._path_live_chk.stateChanged.connect(self._on_path_live_toggled)
 
-        self._tabs.addTab(_path_tab_container, "Path & Heatmap")
+        self._tabs.addTab(_path_tab_container, "Path & Heatmap")  # Tab 1
 
         self._splitter.addWidget(self._video)
         self._splitter.addWidget(self._tabs)
@@ -1695,26 +1080,50 @@ class MainWindow(QMainWindow):
         self.setStatusBar(self._status)
         self._status.showMessage("Ready — open a video file to begin.")
 
-    # ------------------------------------------------------------------ banner
-
-    def _show_mmaction2_banner(self):
-        from backend.action_recognizer import ActionRecognizer
-        if ActionRecognizer.is_available():
-            self._banner.setVisible(False)
-        else:
-            short = ActionRecognizer.unavailable_reason().split(".")[0] + "."
-            self._banner_label.setText(
-                f"MMAction2 unavailable — {short}  "
-                f"'Run Full Analysis' will use YOLO spatial labels only."
-            )
-
     # ------------------------------------------------------------------ video loaded
+
+    def _clear_all_results(self):
+        """
+        Wipe all analysis data from a previous video so stale results
+        are never displayed against a newly loaded file.
+        Called when a video loads with no existing _results.json.
+        """
+        # State
+        self._raw_frames         = None
+        self._path_points        = []
+        self._path_stats         = None
+        self._analysis_episodes  = []
+        self._analysis_reg_stats = []
+        self._analysis_speed_s   = []
+        self._region_time_ranges = []
+        self._capture_conf_floor = 0.05
+
+        # Video overlays
+        self._video.set_frame_detections({})
+        self._video.set_trail_points([])
+
+        # Path map
+        self._path_map.set_path([])
+        self._path_map.set_heatmap(None)
+        self._path_stats_lbl.setText("No path data — run Track Path first.")
+        self._path_stats_lbl.setStyleSheet("font-size:10px; color:#8899aa;")
+        self._export_path_btn.setEnabled(False)
+        self._analysis_btn.setEnabled(False)
+
+        # Tables
+        self._region_table.set_rows([])
+
+        # Tab labels
+        self._tabs.setTabText(0, "Regions")
+        self._tabs.setTabText(1, "Path & Heatmap")
+
+        # Labels
+        self._source_label.setText("")
 
     def _on_video_loaded(self, path: str):
         self._video_path = path
+        self._run_all_btn.setEnabled(True)
         self._yolo_btn.setEnabled(True)
-        self._full_btn.setEnabled(True)
-        self._mmaction2_btn.setEnabled(True)
         self._track_path_btn.setEnabled(True)
         self._calibrate_btn.setEnabled(True)
         self._edit_regions_btn.setEnabled(True)
@@ -1745,6 +1154,10 @@ class MainWindow(QMainWindow):
                     f"Warning: could not load homography: {exc}"
                 )
 
+        # Clear any data from the previous video before loading the new one.
+        # This ensures sections absent from the new JSON don't show stale values.
+        self._clear_all_results()
+
         # Auto-load results JSON if it exists beside the video
         from backend.results_format import default_output_path
         json_path = default_output_path(path)
@@ -1753,61 +1166,7 @@ class MainWindow(QMainWindow):
         else:
             self._status.showMessage(f"Loaded: {path}")
 
-    # ------------------------------------------------------------------ toggles
-
-    def _on_mock_toggled(self, _state: int):
-        if self._mock_toggle.isChecked():
-            self._inject_mock_data()
-            self._status.showMessage("Mock data mode active.")
-            self._source_label.setText("")
-        else:
-            self._video.clear_detections()
-            self._results.set_results([])
-            self._result_time_ranges = []
-            self._source_label.setText("")
-            self._status.showMessage(
-                "Mock data cleared — run analysis or load a JSON file."
-            )
-
-    def _on_debug_toggled(self, _state: int):
-        self._results.set_debug_mode(self._debug_toggle.isChecked())
-
-    # ------------------------------------------------------------------ mock data
-
-    def _inject_mock_data(self):
-        self._video.set_bounding_boxes(MOCK_BOUNDING_BOXES)
-        self._results.set_results(MOCK_RESULTS)
-        self._result_time_ranges = [
-            (_hms_to_ms(r[0]), _hms_to_ms(r[1])) for r in MOCK_RESULTS
-        ]
-
-    # ------------------------------------------------------------------ region editing
-
     # ------------------------------------------------------------------ model selection
-
-    def _update_mmaction2_btn_label(self):
-        """Refresh the MMAction2 model button label based on checked actions."""
-        from backend.action_recognizer import MODEL_DISPLAY_NAMES
-        checked = [a.data() for a in self._mm_model_actions if a.isChecked()]
-        if not checked:
-            label = "⚠ none selected"
-        elif len(checked) == len(self._mm_model_actions):
-            label = " + ".join(
-                MODEL_DISPLAY_NAMES.get(k, k).replace("TSN ", "")
-                for k in checked
-            )
-        else:
-            label = " + ".join(
-                MODEL_DISPLAY_NAMES.get(k, k).replace("TSN ", "")
-                for k in checked
-            )
-        self._mmaction2_model_btn.setText(f"{label}  ▾")
-
-    def _get_enabled_mmaction2_models(self) -> list[str]:
-        """Return dataset keys for checked MMAction2 models (fallback: all)."""
-        enabled = [a.data() for a in self._mm_model_actions if a.isChecked()]
-        return enabled if enabled else [m["dataset"]
-                                        for m in self._mm_model_actions]
 
     def _on_yolo_model_changed(self, _index: int):
         """Show/hide YOLO-World classes row when YOLO-World is selected."""
@@ -1830,11 +1189,6 @@ class MainWindow(QMainWindow):
         self._world_classes = [
             c.strip() for c in text.split(",") if c.strip()
         ]
-
-    def _on_subject_classes_changed(self, text: str):
-        """Parse the subject classes field; always include 'person'."""
-        extra = {c.strip().lower() for c in text.split(",") if c.strip()}
-        self._subject_labels = {"person"} | extra
 
     def _get_yolo_model_name(self) -> str:
         """Return the actual model filename for the currently selected YOLO model."""
@@ -1862,17 +1216,12 @@ class MainWindow(QMainWindow):
             return
         try:
             from backend.yolo_classes_config import save_class_list
-            # Save subject classes too (exclude "person" — always implicit — but
-            # include everything else the user typed in the Subject classes field)
-            extra_subjects = sorted(self._subject_labels - {"person"})
             save_class_list(
                 path, config_name.strip(), self._world_classes,
-                subject_classes=extra_subjects if extra_subjects else None,
             )
             self._status.showMessage(
                 f"Class list saved → {Path(path).name}  "
-                f"({len(self._world_classes)} classes, "
-                f"{len(extra_subjects)} extra subject(s))"
+                f"({len(self._world_classes)} classes)"
             )
         except Exception as exc:
             self._status.showMessage(f"Failed to save class list: {exc}")
@@ -1888,101 +1237,16 @@ class MainWindow(QMainWindow):
             return
         try:
             from backend.yolo_classes_config import load_class_list
-            config_name, classes, subject_classes = load_class_list(path)
+            config_name, classes, _subject_classes = load_class_list(path)
             self._world_classes = classes
             self._world_classes_edit.setText(", ".join(classes))
-            # Restore subject classes if the file has them
-            if subject_classes:
-                self._subject_classes_edit.setText(", ".join(subject_classes))
-                # _on_subject_classes_changed fires via textChanged signal
             msg = (
                 f"Class list loaded: '{config_name}'  "
-                f"({len(classes)} class{'es' if len(classes) != 1 else ''}"
+                f"({len(classes)} class{'es' if len(classes) != 1 else ''})"
             )
-            if subject_classes:
-                msg += f", subjects: {', '.join(subject_classes)}"
-            msg += ")"
             self._status.showMessage(msg)
         except Exception as exc:
             self._status.showMessage(f"Failed to load class list: {exc}")
-
-    # ------------------------------------------------------------------ region editing
-
-    # ------------------------------------------------------------------ label filter
-
-    def _get_all_object_labels(self) -> list[str]:
-        """All unique non-subject detected labels from the current YOLO run."""
-        if not self._raw_frames:
-            return []
-        return sorted({
-            d.label
-            for fd in self._raw_frames
-            for d in fd.detections
-            if d.label not in self._subject_labels
-        })
-
-    def _get_detected_subjects(self) -> list[str]:
-        """Subject labels that were actually detected in the current run."""
-        if not self._raw_frames:
-            return ["person"]
-        detected = {
-            d.label
-            for fd in self._raw_frames
-            for d in fd.detections
-            if d.label in self._subject_labels
-        }
-        # Always include "person" even if not detected (so it shows in dialog)
-        detected.add("person")
-        return sorted(detected)
-
-    def _open_label_filter(self):
-        """Open (or bring to front) the non-modal interaction filter dialog."""
-        all_labels   = self._get_all_object_labels()
-        all_subjects = self._get_detected_subjects()
-        if not all_labels and not all_subjects:
-            self._status.showMessage(
-                "No YOLO data loaded yet — run YOLO first."
-            )
-            return
-        if self._label_filter_dlg and self._label_filter_dlg.isVisible():
-            self._label_filter_dlg.populate(
-                all_subjects, all_labels,
-                self._subject_filter_excluded, self._label_filter_excluded,
-            )
-            self._label_filter_dlg.raise_()
-            self._label_filter_dlg.activateWindow()
-        else:
-            self._label_filter_dlg = _InteractionFilterDialog(
-                all_subjects=all_subjects,
-                all_labels=all_labels,
-                excl_subjects=self._subject_filter_excluded,
-                excl_labels=self._label_filter_excluded,
-                on_change=self._on_interaction_filter_changed,
-                parent=self,
-            )
-            self._label_filter_dlg.show()
-
-    def _on_interaction_filter_changed(
-        self, excl_subjects: set[str], excl_labels: set[str]
-    ):
-        """Called by the dialog whenever any checkbox changes."""
-        self._subject_filter_excluded = excl_subjects
-        self._label_filter_excluded   = excl_labels
-        n_hidden = len(excl_subjects) + len(excl_labels)
-        self._results.set_filter_status(n_hidden)
-        self._schedule_refilter()
-
-    def _hide_label(self, label: str):
-        """Called by the right-click 'Hide' action on a table row."""
-        self._label_filter_excluded.add(label)
-        if self._label_filter_dlg and self._label_filter_dlg.isVisible():
-            self._label_filter_dlg.set_excluded_labels(self._label_filter_excluded)
-            self._label_filter_dlg._obj_list.itemChanged.connect(
-                self._label_filter_dlg._changed
-            )
-        n_hidden = len(self._label_filter_excluded) + len(self._subject_filter_excluded)
-        self._results.set_filter_status(n_hidden)
-        self._schedule_refilter()
 
     # ------------------------------------------------------------------ region editing
 
@@ -2095,7 +1359,6 @@ class MainWindow(QMainWindow):
         try:
             from backend.results_format import (
                 load_results, raw_frames_to_frame_detections,
-                action_clips_from_json,
             )
             data = load_results(json_path)
 
@@ -2106,19 +1369,13 @@ class MainWindow(QMainWindow):
             raw_frames = raw_frames_to_frame_detections(
                 data["frame_detections"]["frames"], fps
             )
-            action_clips = action_clips_from_json(
-                data.get("action_recognition", {})
-            )
 
             self._raw_frames         = raw_frames
-            self._action_clips       = action_clips
             self._analysis_fw        = fw
             self._analysis_fh        = fh
             self._capture_conf_floor = float(
                 data["frame_detections"].get("capture_conf_floor", 0.05)
             )
-
-            self._mock_toggle.setChecked(False)
 
             # Restore path tracking data if present
             path_section = data.get("path_tracking", {})
@@ -2157,7 +1414,7 @@ class MainWindow(QMainWindow):
                     self._path_stats_lbl.setStyleSheet("font-size:10px; color:#aabbcc;")
                     self._export_path_btn.setEnabled(True)
                     self._analysis_btn.setEnabled(True)
-                    self._tabs.setTabText(3, f"Path & Heatmap ({len(path_pts)} pts)")
+                    self._tabs.setTabText(1, f"Path & Heatmap ({len(path_pts)} pts)")
                 except Exception as path_exc:
                     print(f"[LoadJSON] Could not restore path data: {path_exc}")
 
@@ -2183,59 +1440,13 @@ class MainWindow(QMainWindow):
 
     def _refilter(self):
         """
-        Apply current thresholds to all three result tabs.
-        Safe to call when _raw_frames is None (MMAction2-only mode).
+        Apply current YOLO conf and min-duration thresholds.
+        Redraws YOLO boxes on the video and recomputes the Region Presence tab.
         """
-        mm_conf        = self._mmaction2_conf_spin.value()
-        min_dur        = int(self._min_dur_spin.value() * 1000)
-        filtered_clips = [c for c in self._action_clips
-                          if c.confidence >= mm_conf]
-        if self._action_merge_chk.isChecked() and filtered_clips:
-            gap_ms = self._action_merge_gap_spin.value()
-            filtered_clips = _merge_action_clips(filtered_clips, gap_ms)
-
-        # ── Tab 2: MMAction2 actions (always available) ──
-        self._action_table.set_rows([
-            (_fmt_ms(c.start_ms),
-             _fmt_ms(c.end_ms),
-             _fmt_dur(c.end_ms - c.start_ms),
-             c.action_label,
-             f"{c.confidence:.3f}",
-             c.model_name)
-            for c in filtered_clips
-        ])
-        self._action_time_ranges = [
-            (int(c.start_ms), int(c.end_ms)) for c in filtered_clips
-        ]
-
-        # ── Video overlay: action-label banner ──
-        self._video.set_action_clips([
-            {"start_ms":     c.start_ms,
-             "end_ms":       c.end_ms,
-             "action_label": c.action_label,
-             "confidence":   c.confidence}
-            for c in filtered_clips
-        ])
-
-        if not self._raw_frames:
-            n_clips = len(filtered_clips)
-            self._source_label.setText(
-                f"Action conf ≥ {mm_conf:.2f}  —  "
-                f"{n_clips} action clip{'s' if n_clips != 1 else ''}"
-                + ("  (no YOLO data loaded)" if not self._action_clips else "")
-            )
-            # Clear YOLO-dependent tabs so stale data isn't shown
-            self._results.set_results([])
-            self._region_table.set_rows([])
-            return
-
-        from backend.interaction_mapper import InteractionMapper
-        from backend.segment_builder   import SegmentBuilder
-
-        conf = self._conf_spin.value()
-        prox = self._prox_spin.value()
-        fw   = self._analysis_fw
-        fh   = self._analysis_fh
+        conf    = self._conf_spin.value()
+        min_dur = int(self._min_dur_spin.value() * 1000)
+        fw      = self._analysis_fw
+        fh      = self._analysis_fh
 
         if fw == 0 or fh == 0:
             fw = self._video.frame_width
@@ -2245,39 +1456,15 @@ class MainWindow(QMainWindow):
             self._analysis_fw = fw
             self._analysis_fh = fh
 
-        filtered = _filter_frames(self._raw_frames, conf)
+        if not self._raw_frames:
+            return
 
-        # ── Tab 0: Object Interactions ──
-        mapped = InteractionMapper(
-            proximity_px=prox,
-            subject_labels=self._subject_labels,
-        ).map(filtered)
-        # Object Interactions tab shows pure YOLO spatial labels only.
-        # MMAction2 clips are displayed separately in the Actions tab — passing
-        # them here would cause apply_action_labels() to replace "near ball" with
-        # "Running ball", mixing two unrelated data streams.
-        segs, ui_boxes = SegmentBuilder(fw, fh, min_duration_ms=min_dur).build(mapped)
-        self._video.set_frame_detections(_convert_boxes(ui_boxes))
+        # ── YOLO bounding-box overlay ──
+        self._video.set_frame_detections(
+            _raw_detections_to_ui_boxes(self._raw_frames, conf, fw, fh)
+        )
 
-        # Apply subject + label exclusion filters before building table rows
-        visible_segs = segs
-        if self._subject_filter_excluded:
-            visible_segs = [
-                s for s in visible_segs
-                if s.subject_label not in self._subject_filter_excluded
-            ]
-        table_rows = [s.as_table_row() for s in visible_segs]
-        if self._label_filter_excluded:
-            table_rows = [
-                r for r in table_rows
-                if r[3] not in self._label_filter_excluded
-            ]
-        self._results.set_results(table_rows)
-        self._result_time_ranges = [
-            (_hms_to_ms(r[0]), _hms_to_ms(r[1])) for r in table_rows
-        ]
-
-        # ── Tab 1: Region Presence ──
+        # ── Tab 0: Region Presence ──
         region_segs = _compute_region_segments(
             self._raw_frames, conf, self._regions, fw, fh, min_dur
         )
@@ -2292,16 +1479,8 @@ class MainWindow(QMainWindow):
         self._region_time_ranges = [
             (int(s["start_ms"]), int(s["end_ms"])) for s in region_segs
         ]
-
-        # ── Update tab labels with row counts ──
-        n      = len(table_rows)   # post-filter count
-        n_reg  = len(region_segs)
-        n_clip = len(filtered_clips)
-        n_hidden = len(self._label_filter_excluded) + len(self._subject_filter_excluded)
-        self._results.set_filter_status(n_hidden)
-        self._tabs.setTabText(0, f"Object Interactions ({n})")
-        self._tabs.setTabText(1, f"Regions ({n_reg})")
-        self._tabs.setTabText(2, f"Actions ({n_clip})")
+        n_reg = len(region_segs)
+        self._tabs.setTabText(0, f"Regions ({n_reg})")
 
         floor     = self._capture_conf_floor
         floor_warn = (
@@ -2309,72 +1488,28 @@ class MainWindow(QMainWindow):
             if conf < floor else ""
         )
         self._source_label.setText(
-            f"YOLO conf ≥ {conf:.2f}  ·  Action conf ≥ {mm_conf:.2f}  ·  "
-            f"prox ≤ {prox} px  ·  min {self._min_dur_spin.value():.1f} s  —  "
-            f"{n} interaction{'s' if n != 1 else ''}  ·  "
-            f"{n_reg} region segment{'s' if n_reg != 1 else ''}  ·  "
-            f"{n_clip} action{'s' if n_clip != 1 else ''}{floor_warn}"
+            f"YOLO conf ≥ {conf:.2f}  ·  min {self._min_dur_spin.value():.1f} s  —  "
+            f"{n_reg} region segment{'s' if n_reg != 1 else ''}{floor_warn}"
         )
-
-        if n == 0 and not n_reg and not n_clip:
-            n_above = sum(
-                1 for fd in self._raw_frames
-                for d in fd.detections
-                if d.confidence >= conf and d.label != "person"
-            )
-            self._status.showMessage(
-                f"⚠ No results at current thresholds  "
-                f"({n_above} non-person detections ≥ {conf:.2f}).  "
-                f"Try lowering Conf or increasing Proximity."
-            )
-        else:
-            self._status.showMessage(
-                f"{n} interaction{'s' if n != 1 else ''}  ·  "
-                f"{n_reg} region segment{'s' if n_reg != 1 else ''}  ·  "
-                f"{n_clip} action{'s' if n_clip != 1 else ''}  "
-                f"(YOLO ≥ {conf:.2f}, action ≥ {mm_conf:.2f}, "
-                f"prox ≤ {prox} px, min {self._min_dur_spin.value():.1f} s)"
-            )
+        self._status.showMessage(
+            f"{n_reg} region segment{'s' if n_reg != 1 else ''}  "
+            f"(YOLO ≥ {conf:.2f}, min {self._min_dur_spin.value():.1f} s)"
+        )
 
     # ------------------------------------------------------------------ pipeline launchers
 
+    def _run_all(self):
+        """Run YOLO then automatically chain into Track Path on completion."""
+        if not self._check_same_settings("yolo"):
+            return
+        self._run_all_mode = True
+        self._launch_worker(_YoloWorker)
+
     def _run_yolo(self):
+        self._run_all_mode = False   # standalone YOLO — no chaining
         if not self._check_same_settings("yolo"):
             return
         self._launch_worker(_YoloWorker)
-
-    def _run_full(self):
-        if not self._check_same_settings("yolo"):
-            return
-        self._launch_worker(_FullAnalysisWorker)
-
-    def _run_mmaction2(self):
-        """Launch MMAction2 only, without re-running YOLO."""
-        if not self._video_path:
-            self._status.showMessage("No video loaded.")
-            return
-        if self._worker_thread and self._worker_thread.isRunning():
-            return
-        if not self._check_same_settings("action"):
-            return
-
-        self._set_running(True)
-        self._worker = _MMAction2Worker(
-            self._video_path,
-            enabled_models=self._get_enabled_mmaction2_models(),
-        )
-        self._worker_thread = QThread()
-        self._worker.moveToThread(self._worker_thread)
-
-        self._worker_thread.started.connect(self._worker.run)
-        self._worker.progress.connect(self._progress.setValue)
-        self._worker.status.connect(self._on_worker_status)
-        self._worker.finished.connect(self._on_mmaction2_finished)
-        self._worker.error.connect(self._on_error)
-        self._worker.finished.connect(lambda *_: self._worker_thread.quit())
-        self._worker.error.connect(   lambda *_: self._worker_thread.quit())
-
-        self._worker_thread.start()
 
     def _launch_worker(self, worker_cls):
         if not self._video_path:
@@ -2393,19 +1528,7 @@ class MainWindow(QMainWindow):
         display_conf = self._conf_spin.value()
         yolo_model   = self._get_yolo_model_name()
         is_world     = "world" in yolo_model.lower()
-        # Merge subject classes (hand, foot…) into the detection list so they
-        # get detected by YOLO-World even if the user forgot to add them above.
-        if is_world:
-            # YOLO-World needs every label listed explicitly — auto-add all
-            # subject classes (including "person") if not already present.
-            merged_cls = list(dict.fromkeys(
-                self._world_classes + [s for s in self._subject_labels
-                                       if s not in self._world_classes]
-            ))
-            world_cls = merged_cls
-        else:
-            world_cls = None
-        mm_models    = self._get_enabled_mmaction2_models()
+        world_cls    = self._world_classes if is_world else None
 
         self._set_running(True)
         self._worker = worker_cls(
@@ -2417,7 +1540,6 @@ class MainWindow(QMainWindow):
             total_frames=self._video.total_frames,
             yolo_model=yolo_model,
             world_classes=world_cls,
-            enabled_mm_models=mm_models,
             yolo_run_settings=self._get_current_yolo_run_settings(),
         )
         self._worker_thread = QThread()
@@ -2439,15 +1561,14 @@ class MainWindow(QMainWindow):
         self._phase_label.setText(msg)
         self._status.showMessage(msg)
 
-    def _on_finished(self, raw_frames, action_clips, diagnostic: str):
+    def _on_finished(self, raw_frames, _action_clips, diagnostic: str):
         self._set_running(False)
         if diagnostic == "Cancelled":
+            self._run_all_mode = False
             self._status.showMessage("Analysis cancelled.")
             return
-        self._mock_toggle.setChecked(False)
 
         self._raw_frames         = raw_frames
-        self._action_clips       = action_clips
         self._analysis_fw        = self._video.frame_width
         self._analysis_fh        = self._video.frame_height
         self._capture_conf_floor = 0.05
@@ -2455,55 +1576,16 @@ class MainWindow(QMainWindow):
         from backend.results_format import default_output_path
         json_path = default_output_path(self._video_path)
         self._source_label.setText(
-            f"Run complete  ·  auto-saved → {json_path.name}  ·  refiltering…"
+            f"YOLO complete  ·  auto-saved → {json_path.name}  ·  refiltering…"
         )
-        self._status.showMessage(f"Analysis complete — {diagnostic}")
-        # Refresh the filter dialog if open (new labels/subjects may have appeared)
-        if self._label_filter_dlg and self._label_filter_dlg.isVisible():
-            self._label_filter_dlg.populate(
-                self._get_detected_subjects(),
-                self._get_all_object_labels(),
-                self._subject_filter_excluded,
-                self._label_filter_excluded,
-            )
+        self._status.showMessage(f"YOLO complete — {diagnostic}")
         self._refilter()
 
-    def _on_mmaction2_finished(self, action_clips, diagnostic: str):
-        """Slot for standalone MMAction2 run (no YOLO data involved)."""
-        self._set_running(False)
-        if diagnostic == "Cancelled":
-            self._status.showMessage("Analysis cancelled.")
-            return
-        self._action_clips = action_clips
-
-        # Upsert action section in JSON (preserves YOLO + path sections)
-        if self._video_path:
-            from backend.results_format import (
-                default_output_path, upsert_action_section,
-            )
-            json_path = default_output_path(self._video_path)
-            try:
-                upsert_action_section(
-                    output_path  = json_path,
-                    video_path   = self._video_path,
-                    fps          = self._video.fps,
-                    fw           = self._video.frame_width,
-                    fh           = self._video.frame_height,
-                    total_frames = self._video.total_frames,
-                    action_clips = action_clips,
-                    run_settings = self._get_current_action_run_settings(),
-                )
-            except Exception as exc:
-                print(f"[UI] WARNING: could not save action JSON: {exc}")
-
-        n = len(action_clips)
-        self._source_label.setText(
-            f"MMAction2 complete  ·  {n} clip{'s' if n != 1 else ''} captured  ·  "
-            f"use 'Action conf ≥' slider to filter"
-        )
-        self._status.showMessage(f"MMAction2 complete — {diagnostic}")
-        # refilter updates the banner and source label (YOLO part skipped if no raw_frames)
-        self._refilter()
+        # Chain into Track Path if "Run All" was requested
+        if self._run_all_mode:
+            self._run_all_mode = False
+            self._status.showMessage("YOLO done — starting Track Path…")
+            self._run_path_tracking()
 
     # ------------------------------------------------------------------ path tracking
 
@@ -2589,7 +1671,7 @@ class MainWindow(QMainWindow):
         self._export_path_btn.setEnabled(len(path_pts) > 0)
 
         n = len(path_pts)
-        self._tabs.setTabText(3, f"Path & Heatmap ({n} pts)")
+        self._tabs.setTabText(1, f"Path & Heatmap ({n} pts)")
         self._analysis_btn.setEnabled(n > 0)
         self._status.showMessage(f"Path tracking complete — {diagnostic}")
 
@@ -2834,12 +1916,9 @@ class MainWindow(QMainWindow):
     def _set_running(self, running: bool):
         has_video = self._video_path is not None
         self._yolo_btn.setEnabled(not running and has_video)
-        self._full_btn.setEnabled(not running and has_video)
-        self._mmaction2_btn.setEnabled(not running and has_video)
         self._track_path_btn.setEnabled(not running and has_video)
         self._calibrate_btn.setEnabled(not running and has_video)
         self._load_json_btn.setEnabled(not running)
-        self._mock_toggle.setEnabled(not running)
         self._sample_spin.setEnabled(not running)
         self._all_classes_chk.setEnabled(not running)
         self._progress.setValue(0)
@@ -2856,12 +1935,8 @@ class MainWindow(QMainWindow):
         self._last_position_ms = position_ms
         if self._path_live_mode and self._path_points:
             self._path_map.set_time_cutoff(position_ms)
-        if self._result_time_ranges:
-            self._results.highlight_row_at(position_ms, self._result_time_ranges)
         if self._region_time_ranges:
             self._region_table.highlight_row_at(position_ms, self._region_time_ranges)
-        if self._action_time_ranges:
-            self._action_table.highlight_row_at(position_ms, self._action_time_ranges)
 
     # ------------------------------------------------------------------ seekbar highlight
 
@@ -3420,6 +2495,7 @@ class MainWindow(QMainWindow):
 
     def _cancel_worker(self):
         """Request cancellation of the currently running worker."""
+        self._run_all_mode = False   # abort any pending chain
         if self._worker is not None and hasattr(self._worker, "cancel"):
             self._worker.cancel()
             self._cancel_btn.setEnabled(False)
@@ -3481,17 +2557,13 @@ class MainWindow(QMainWindow):
 
     def _open_config_dialog(self):
         dlg = _ConfigDialog(
-            current_size        = self._font_size,
-            current_theme       = self._theme_name,
-            current_clip_len    = self._clip_len_frames,
-            current_clip_stride = self._clip_stride_frames,
-            parent              = self,
+            current_size  = self._font_size,
+            current_theme = self._theme_name,
+            parent        = self,
         )
         if dlg.exec() == QDialog.DialogCode.Accepted:
-            self._font_size          = dlg.selected_size()
-            self._theme_name         = dlg.selected_theme()
-            self._clip_len_frames    = dlg.clip_len()
-            self._clip_stride_frames = dlg.clip_stride()
+            self._font_size  = dlg.selected_size()
+            self._theme_name = dlg.selected_theme()
             self.setStyleSheet(_make_qss(self._font_size, self._theme_name))
 
     # ------------------------------------------------------------------ run-settings helpers
@@ -3504,13 +2576,6 @@ class MainWindow(QMainWindow):
             "frame_stride":       self._sample_spin.value(),
             "detect_all_classes": self._all_classes_chk.isChecked(),
             "world_classes":      sorted(self._world_classes) if is_world else [],
-        }
-
-    def _get_current_action_run_settings(self) -> dict:
-        return {
-            "enabled_models": self._get_enabled_mmaction2_models(),
-            "clip_length":    self._clip_len_frames,
-            "clip_stride":    self._clip_stride_frames,
         }
 
     def _get_current_path_run_settings(self) -> dict:
@@ -3528,7 +2593,7 @@ class MainWindow(QMainWindow):
             return True
         from backend.results_format import (
             default_output_path,
-            get_yolo_run_settings, get_action_run_settings, get_path_run_settings,
+            get_yolo_run_settings, get_path_run_settings,
         )
         json_path = default_output_path(self._video_path)
         if not json_path.exists():
@@ -3537,9 +2602,6 @@ class MainWindow(QMainWindow):
         if run_type == "yolo":
             stored  = get_yolo_run_settings(json_path)
             current = self._get_current_yolo_run_settings()
-        elif run_type == "action":
-            stored  = get_action_run_settings(json_path)
-            current = self._get_current_action_run_settings()
         elif run_type == "path":
             stored  = get_path_run_settings(json_path)
             current = self._get_current_path_run_settings()
@@ -3576,41 +2638,24 @@ class MainWindow(QMainWindow):
     def _load_settings(self):
         s = self._settings()
         # Spinboxes / numeric params
-        self._conf_spin.setValue(           float(s.value("yolo_conf",   0.25)))
-        self._mmaction2_conf_spin.setValue( float(s.value("action_conf", 0.50)))
-        self._prox_spin.setValue(           int(  s.value("proximity",   150)))
-        self._min_dur_spin.setValue(        float(s.value("min_dur",     0.2)))
-        self._sample_spin.setValue(         int(  s.value("sample_rate", 1)))
+        self._conf_spin.setValue(  float(s.value("yolo_conf",   0.25)))
+        self._min_dur_spin.setValue(float(s.value("min_dur",    0.2)))
+        self._sample_spin.setValue( int(  s.value("sample_rate", 1)))
         # Checkboxes
-        self._all_classes_chk.setChecked( s.value("all_classes",   True,  type=bool))
-        self._yolo_vis_chk.setChecked(    s.value("yolo_vis",      True,  type=bool))
-        self._action_vis_chk.setChecked(  s.value("action_vis",    True,  type=bool))
-        self._trail_vis_chk.setChecked(   s.value("trail_vis",     True,  type=bool))
-        self._debug_toggle.setChecked(    s.value("debug_mode",    False, type=bool))
+        self._all_classes_chk.setChecked(s.value("all_classes", True, type=bool))
+        self._yolo_vis_chk.setChecked(   s.value("yolo_vis",    True, type=bool))
+        self._trail_vis_chk.setChecked(  s.value("trail_vis",   True, type=bool))
         # YOLO model
         idx = int(s.value("yolo_model_idx", 0))
         if 0 <= idx < self._yolo_model_combo.count():
             self._yolo_model_combo.setCurrentIndex(idx)
-        # MMAction2 model checkboxes
-        for act in self._mm_model_actions:
-            key = f"mm_model_{act.data()}"
-            act.setChecked(s.value(key, True, type=bool))
         # YOLO-World classes
         world_text = s.value("world_classes_text", "")
         if world_text:
             self._world_classes_edit.setText(world_text)
-        # Subject classes
-        subj_text = s.value("subject_classes_text", "")
-        if subj_text:
-            self._subject_classes_edit.setText(subj_text)
-        # Appearance / recognition-window
-        self._font_size          = int(  s.value("font_size",         12))
-        self._theme_name         = str(  s.value("theme_name",        "Dark Blue"))
-        self._clip_len_frames    = int(  s.value("clip_len_frames",   32))
-        self._clip_stride_frames = int(  s.value("clip_stride_frames",16))
-        # Merge controls
-        self._action_merge_chk.setChecked(  s.value("action_merge",      False, type=bool))
-        self._action_merge_gap_spin.setValue(int(s.value("action_merge_gap", 500)))
+        # Appearance
+        self._font_size  = int(s.value("font_size",  12))
+        self._theme_name = str(s.value("theme_name", "Dark Blue"))
         # Auto-reload last-used regions file
         last_regions = s.value("last_regions_path", "")
         if last_regions and Path(last_regions).exists():
@@ -3625,27 +2670,16 @@ class MainWindow(QMainWindow):
 
     def _save_settings(self):
         s = self._settings()
-        s.setValue("yolo_conf",           self._conf_spin.value())
-        s.setValue("action_conf",         self._mmaction2_conf_spin.value())
-        s.setValue("proximity",           self._prox_spin.value())
-        s.setValue("min_dur",             self._min_dur_spin.value())
-        s.setValue("sample_rate",         self._sample_spin.value())
-        s.setValue("all_classes",         self._all_classes_chk.isChecked())
-        s.setValue("yolo_vis",            self._yolo_vis_chk.isChecked())
-        s.setValue("action_vis",          self._action_vis_chk.isChecked())
-        s.setValue("trail_vis",           self._trail_vis_chk.isChecked())
-        s.setValue("debug_mode",          self._debug_toggle.isChecked())
-        s.setValue("yolo_model_idx",      self._yolo_model_combo.currentIndex())
-        for act in self._mm_model_actions:
-            s.setValue(f"mm_model_{act.data()}", act.isChecked())
-        s.setValue("world_classes_text",   self._world_classes_edit.text())
-        s.setValue("subject_classes_text", self._subject_classes_edit.text())
-        s.setValue("font_size",            self._font_size)
-        s.setValue("theme_name",           self._theme_name)
-        s.setValue("clip_len_frames",      self._clip_len_frames)
-        s.setValue("clip_stride_frames",   self._clip_stride_frames)
-        s.setValue("action_merge",         self._action_merge_chk.isChecked())
-        s.setValue("action_merge_gap",     self._action_merge_gap_spin.value())
+        s.setValue("yolo_conf",          self._conf_spin.value())
+        s.setValue("min_dur",            self._min_dur_spin.value())
+        s.setValue("sample_rate",        self._sample_spin.value())
+        s.setValue("all_classes",        self._all_classes_chk.isChecked())
+        s.setValue("yolo_vis",           self._yolo_vis_chk.isChecked())
+        s.setValue("trail_vis",          self._trail_vis_chk.isChecked())
+        s.setValue("yolo_model_idx",     self._yolo_model_combo.currentIndex())
+        s.setValue("world_classes_text", self._world_classes_edit.text())
+        s.setValue("font_size",          self._font_size)
+        s.setValue("theme_name",         self._theme_name)
 
     def closeEvent(self, event):
         self._save_settings()
@@ -3655,36 +2689,6 @@ class MainWindow(QMainWindow):
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-def _merge_action_clips(clips: list, gap_ms: float) -> list:
-    """
-    Merge consecutive clips that share the same action_label and whose gap
-    is within gap_ms, keeping the max confidence and spanning start→end.
-    Input clips do not need to be sorted (sorted internally).
-    """
-    if not clips:
-        return clips
-    from backend.action_recognizer import ActionClip
-    sorted_clips = sorted(clips, key=lambda c: c.start_ms)
-    merged = []
-    cur = sorted_clips[0]
-    for nxt in sorted_clips[1:]:
-        if (nxt.action_label == cur.action_label
-                and nxt.start_ms - cur.end_ms <= gap_ms):
-            cur = ActionClip(
-                start_ms     = cur.start_ms,
-                end_ms       = max(cur.end_ms, nxt.end_ms),
-                action_label = cur.action_label,
-                raw_label    = cur.raw_label,
-                confidence   = max(cur.confidence, nxt.confidence),
-                model_name   = cur.model_name,
-            )
-        else:
-            merged.append(cur)
-            cur = nxt
-    merged.append(cur)
-    return merged
-
 
 def _filter_frames(raw_frames: list, conf_threshold: float) -> list:
     """Return FrameDetections list keeping only detections ≥ conf_threshold."""
@@ -3704,8 +2708,7 @@ def _filter_frames(raw_frames: list, conf_threshold: float) -> list:
 def _save_results_quietly(
     video_path, segments, raw_frames,
     fps, frame_w, frame_h, total_frames,
-    stride, display_conf, all_classes, mmaction2_used,
-    action_clips=None,
+    stride, display_conf, all_classes,
     yolo_run_settings=None,
 ) -> "Path | None":
     """Save _results.json next to the video.  Never raises — logs on failure."""
@@ -3715,18 +2718,14 @@ def _save_results_quietly(
         )
         output_path = default_output_path(video_path)
         settings = {
-            "frame_sample_rate":              stride,
-            "capture_conf_floor":             CAPTURE_CONF_FLOOR,
-            "display_conf_threshold":         display_conf,
-            "all_classes_mode":               all_classes,
-            "iou_threshold":                  0.05,
-            "proximity_threshold_px":         150,
-            "mmaction2_confidence_threshold":  0.50,
-            "min_segment_duration_sec":        0.2,
+            "frame_sample_rate":      stride,
+            "capture_conf_floor":     CAPTURE_CONF_FLOOR,
+            "display_conf_threshold": display_conf,
+            "all_classes_mode":       all_classes,
+            "min_segment_duration_sec": 0.2,
         }
         modules_used = {
             "yolo":            True,
-            "mmaction2":       mmaction2_used,
             "region_counting": False,
         }
         save_results(
@@ -3740,7 +2739,7 @@ def _save_results_quietly(
             frame_w=frame_w,
             frame_h=frame_h,
             total_frames=total_frames,
-            action_clips=action_clips or [],
+            action_clips=[],
             yolo_run_settings=yolo_run_settings,
         )
         print(f"[UI] Results saved → {output_path}")
@@ -3755,6 +2754,23 @@ def _convert_boxes(ui_boxes_by_frame: dict) -> dict:
         fi: [(b.label, b.color, b.nx, b.ny, b.nw, b.nh) for b in box_list]
         for fi, box_list in ui_boxes_by_frame.items()
     }
+
+
+def _raw_detections_to_ui_boxes(raw_frames: list, conf: float, fw: int, fh: int) -> dict:
+    """Convert raw FrameDetection list directly to video-overlay box format."""
+    result: dict[int, list] = {}
+    for fd in raw_frames:
+        boxes = []
+        for d in fd.detections:
+            if d.confidence < conf:
+                continue
+            color = (255, 130, 50) if d.label == "person" else (80, 160, 255)
+            boxes.append((d.label, color,
+                          d.x1 / fw, d.y1 / fh,
+                          (d.x2 - d.x1) / fw, (d.y2 - d.y1) / fh))
+        if boxes:
+            result[fd.frame_index] = boxes
+    return result
 
 
 def _hms_to_ms(hms: str) -> int:

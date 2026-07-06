@@ -279,7 +279,7 @@ class VideoPlayerWidget(QWidget):
         self._frame_label.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
         )
-        self._frame_label.setMinimumSize(480, 320)
+        self._frame_label.setMinimumSize(320, 240)
         self._frame_label.region_drawn.connect(self.region_drawn)
         self._frame_label.calibration_click.connect(self.calibration_click)
         root.addWidget(self._frame_label, stretch=1)
@@ -350,11 +350,12 @@ class VideoPlayerWidget(QWidget):
     def total_frames(self) -> int:
         return self._total_frames
 
-    def set_bounding_boxes(self, boxes: list):
-        """Time-range mock overlay."""
-        self._bounding_boxes = boxes
-        self._use_frame_detections = False
-        self._render_frame(self._current_frame)
+    # DEPRECATED — time-range mock overlay (mock_data.py pipeline removed).
+    # def set_bounding_boxes(self, boxes: list):
+    #     """Time-range mock overlay."""
+    #     self._bounding_boxes = boxes
+    #     self._use_frame_detections = False
+    #     self._render_frame(self._current_frame)
 
     def set_frame_detections(self, detections: dict[int, list]):
         """
@@ -369,21 +370,23 @@ class VideoPlayerWidget(QWidget):
         self._use_frame_detections = True
         self._render_frame(self._current_frame)
 
-    def set_action_clips(self, clips: list[dict]):
-        """
-        Set MMAction2 temporal action clips for banner overlay.
-        Each dict: {"start_ms", "end_ms", "action_label", "confidence"}
-        """
-        self._action_clips = clips
-        self._render_frame(self._current_frame)
+    # DEPRECATED — MMAction2 was removed from the app.  Kept for future use.
+    # def set_action_clips(self, clips: list[dict]):
+    #     """
+    #     Set MMAction2 temporal action clips for banner overlay.
+    #     Each dict: {"start_ms", "end_ms", "action_label", "confidence"}
+    #     """
+    #     self._action_clips = clips
+    #     self._render_frame(self._current_frame)
 
     def set_yolo_visible(self, visible: bool):
         self._show_yolo = visible
         self._render_frame(self._current_frame)
 
-    def set_mmaction2_visible(self, visible: bool):
-        self._show_mmaction2 = visible
-        self._render_frame(self._current_frame)
+    # DEPRECATED — MMAction2 was removed from the app.  Kept for future use.
+    # def set_mmaction2_visible(self, visible: bool):
+    #     self._show_mmaction2 = visible
+    #     self._render_frame(self._current_frame)
 
     def set_regions_visible(self, visible: bool):
         self._show_regions = visible
@@ -636,18 +639,19 @@ class VideoPlayerWidget(QWidget):
                 painter.drawText(x + 3, y - 4, label)
 
         # ── MMAction2 action-label banner ──
-        if self._show_mmaction2:
-            action = self._get_active_action(frame_index)
-            if action:
-                banner_h = max(22, h // 20)
-                painter.fillRect(0, h - banner_h, w, banner_h,
-                                 QColor(0, 0, 0, 180))
-                painter.setPen(QPen(QColor(120, 210, 255)))
-                font_sz = max(8, h // 36)
-                painter.setFont(QFont("Arial", font_sz, QFont.Weight.Bold))
-                text = (f"▶ {action['action_label']}"
-                        f"  ({action['confidence']:.2f})")
-                painter.drawText(6, h - banner_h + font_sz + 2, text)
+        # DEPRECATED — MMAction2 was removed from the app.  Kept for future use.
+        # if self._show_mmaction2:
+        #     action = self._get_active_action(frame_index)
+        #     if action:
+        #         banner_h = max(22, h // 20)
+        #         painter.fillRect(0, h - banner_h, w, banner_h,
+        #                          QColor(0, 0, 0, 180))
+        #         painter.setPen(QPen(QColor(120, 210, 255)))
+        #         font_sz = max(8, h // 36)
+        #         painter.setFont(QFont("Arial", font_sz, QFont.Weight.Bold))
+        #         text = (f"▶ {action['action_label']}"
+        #                 f"  ({action['confidence']:.2f})")
+        #         painter.drawText(6, h - banner_h + font_sz + 2, text)
 
         painter.end()
 

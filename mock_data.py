@@ -1,4 +1,7 @@
 # mock_data.py
+# DEPRECATED (2026-07) — the mock-data injection path was removed from the UI.
+# Not imported by any live code path; kept for future reference.
+#
 # Placeholder data used during UI development.
 # BACKEND INJECTION POINT: Replace MOCK_BOUNDING_BOXES with real YOLO detections
 # and MOCK_RESULTS with merged YOLO + MMAction2 output once the backend is ready.

@@ -105,8 +105,10 @@ def save_results(
             pass  # corrupt or missing existing file — just overwrite cleanly
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    # Compact separators — these files hold 10k+ detections; pretty-printing
+    # roughly doubles the size for no benefit.
     with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(doc, f, indent=2)
+        json.dump(doc, f, separators=(",", ":"))
 
 
 def _serialize_segments(segments: list) -> list:
@@ -344,7 +346,7 @@ def _write_json(doc: dict, path: str | Path) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
-        json.dump(doc, f, indent=2)
+        json.dump(doc, f, separators=(",", ":"))
 
 
 def _serialize_track_points(points: list) -> list:
@@ -417,23 +419,30 @@ def upsert_path_section(
     track_points: list,
     room_size_cm: tuple,
     run_settings: dict | None = None,
+    smooth_window: int = 1,
 ) -> None:
-    """Update only the path_tracking section; leave all other sections intact."""
-    from backend.path_analyzer import compute_stats
+    """
+    Update only the path_tracking section; leave all other sections intact.
+
+    track_points are stored RAW (unsmoothed) so smoothing can be re-applied
+    with any window later.  The stats are computed on the smoothed path so the
+    stored numbers match what the UI displays; smooth_window is recorded.
+    """
+    from backend.path_analyzer import compute_stats, smooth_path
 
     doc = _load_or_create_base(output_path, video_path, fps, fw, fh, total_frames)
 
-    stats = compute_stats(track_points)
+    stats = compute_stats(smooth_path(track_points, smooth_window))
     stats_dict: dict = {
         "n_points":       stats.n_points,
         "n_interpolated": stats.n_interpolated,
         "duration_s":     round(stats.duration_s, 2),
         "calibrated":     stats.calibrated,
+        "smooth_window":  smooth_window,
     }
     if stats.calibrated:
         stats_dict["total_distance_m"] = round(stats.total_distance_m, 3)
         stats_dict["avg_speed_m_s"]    = round(stats.avg_speed_m_s, 3)
-        stats_dict["max_speed_m_s"]    = round(stats.max_speed_m_s, 3)
 
     doc["path_tracking"] = {
         "room_size_cm": list(room_size_cm),

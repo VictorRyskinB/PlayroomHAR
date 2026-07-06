@@ -1,4 +1,7 @@
 # backend/action_recognizer.py
+# DEPRECATED (2026-07) — MMAction2 was removed from the app.  Not imported by
+# any live code path; kept for future reference/use.
+#
 # MMAction2-based action recognition using a sliding-window approach.
 #
 # AVAILABILITY: MMAction2 requires mmcv + mmaction2, which as of 2026-05 have

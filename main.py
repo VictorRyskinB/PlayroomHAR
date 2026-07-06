@@ -64,7 +64,15 @@ def _build_parser() -> argparse.ArgumentParser:
 # ---------------------------------------------------------------------------
 
 def run_cli(args) -> None:
-    """Headless pipeline: YOLO → mapper → segments → (optional MMAction2) → JSON."""
+    """
+    DEPRECATED — CLI mode is disabled.
+
+    This headless pipeline still uses the removed object-interaction and
+    MMAction2 modules (InteractionMapper, SegmentBuilder, ActionRecognizer)
+    and no longer matches the UI's YOLO + path-tracking pipeline.  The code
+    is kept for future reference; rework it against the current pipeline
+    before re-enabling the --cli flag in __main__.
+    """
     import cv2
     from pathlib import Path
 
@@ -235,8 +243,11 @@ if __name__ == "__main__":
     args   = parser.parse_args()
 
     if args.cli:
-        if not args.input:
-            parser.error("--input is required in CLI mode")
-        run_cli(args)
+        # DEPRECATED — see run_cli docstring.  The CLI still targets the old
+        # interaction/MMAction2 pipeline and is disabled until reworked.
+        parser.error(
+            "CLI mode is currently disabled — it predates the removal of the "
+            "MMAction2/object-interaction pipeline. Use the desktop UI instead."
+        )
     else:
         run_ui()

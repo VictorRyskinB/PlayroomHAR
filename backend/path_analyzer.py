@@ -53,7 +53,6 @@ class PathStats:
     """Summary statistics for a session path."""
     total_distance_m:  float   # sum of straight-line segments between samples
     avg_speed_m_s:     float   # total distance / total time
-    max_speed_m_s:     float   # peak instantaneous speed
     duration_s:        float
     n_points:          int
     n_interpolated:    int
@@ -76,14 +75,13 @@ class MovementEpisode:
     end_ms:        float
     distance_m:    float   # 0.0 for stationary episodes
     avg_speed_m_s: float   # 0.0 for stationary episodes
-    max_speed_m_s: float   # 0.0 for stationary episodes
 
     @property
     def duration_s(self) -> float:
         return (self.end_ms - self.start_ms) / 1000.0
 
     def as_table_row(self) -> tuple:
-        """7-tuple for the episodes table."""
+        """6-tuple for the episodes table."""
         return (
             _fmt_ms(self.start_ms),
             _fmt_ms(self.end_ms),
@@ -91,7 +89,6 @@ class MovementEpisode:
             self.kind.capitalize(),
             f"{self.distance_m:.2f} m" if self.distance_m > 0 else "—",
             f"{self.avg_speed_m_s:.2f} m/s" if self.avg_speed_m_s > 0 else "—",
-            f"{self.max_speed_m_s:.2f} m/s" if self.max_speed_m_s > 0 else "—",
         )
 
 
@@ -264,7 +261,7 @@ def compute_speed_series(
 
 
 # ---------------------------------------------------------------------------
-# Statistics  (updated to include max_speed_m_s)
+# Statistics
 # ---------------------------------------------------------------------------
 
 def compute_stats(path_points: list[PathPoint]) -> PathStats:
@@ -274,7 +271,7 @@ def compute_stats(path_points: list[PathPoint]) -> PathStats:
     calibrated = any(p.x_cm is not None for p in path_points)
 
     if n < 2:
-        return PathStats(0.0, 0.0, 0.0, 0.0, n, n_interp, calibrated)
+        return PathStats(0.0, 0.0, 0.0, n, n_interp, calibrated)
 
     duration_s = (path_points[-1].timestamp_ms
                   - path_points[0].timestamp_ms) / 1000.0
@@ -289,13 +286,9 @@ def compute_stats(path_points: list[PathPoint]) -> PathStats:
     dist_m   = dist_cm / 100.0 if calibrated else dist_cm
     avg_spd  = dist_m / duration_s if duration_s > 0 else 0.0
 
-    speed_series = compute_speed_series(path_points)
-    max_spd = max((s.speed_m_s for s in speed_series), default=0.0)
-
     return PathStats(
         total_distance_m = dist_m,
         avg_speed_m_s    = avg_spd,
-        max_speed_m_s    = max_spd,
         duration_s       = duration_s,
         n_points         = n,
         n_interpolated   = n_interp,
@@ -361,7 +354,6 @@ def compute_episodes(
     episodes: list[MovementEpisode] = []
     for kind, si, ei in _run_length_encode(labels):
         pts   = path_points[si: ei + 1]
-        spds  = speed_series[si: ei + 1]
         start = pts[0].timestamp_ms
         end   = pts[-1].timestamp_ms
 
@@ -377,11 +369,9 @@ def compute_episodes(
             dist_m  = dist_cm / 100.0
             dur_s   = (end - start) / 1000.0
             avg_spd = dist_m / dur_s if dur_s > 0 else 0.0
-            max_spd = max((s.speed_m_s for s in spds), default=0.0)
         else:
             dist_m  = 0.0
             avg_spd = 0.0
-            max_spd = 0.0
 
         episodes.append(MovementEpisode(
             kind          = kind,
@@ -389,7 +379,6 @@ def compute_episodes(
             end_ms        = end,
             distance_m    = dist_m,
             avg_speed_m_s = avg_spd,
-            max_speed_m_s = max_spd,
         ))
 
     return episodes
@@ -486,6 +475,73 @@ def compute_region_stats(
         ))
 
     return results
+
+
+# ---------------------------------------------------------------------------
+# Region floor-footprint projection (shared by the map widget and Excel export)
+# ---------------------------------------------------------------------------
+
+def project_region_shapes(
+    regions: list[dict],          # [{name, nx, ny, nw, nh}, ...]
+    homography_matrix,            # np.ndarray 3×3 or None
+    frame_w: int,
+    frame_h: int,
+    room_size_cm: tuple[float, float],
+) -> list[dict]:
+    """
+    Project each region's video-space rectangle onto the floor plane.
+
+    Returns one dict per region:
+        {"name": str,
+         "polygon_cm": [(x, y) × 4] | None,   # floor quadrilateral
+         "point_cm":   (x, y) | None}         # bottom-center fallback
+
+    polygon_cm is None when the projection is degenerate — regions with a lot
+    of vertical extent throw their top edge toward the image horizon, which
+    maps to absurd floor coordinates.  In that case point_cm (the projected
+    bottom-center, i.e. the floor contact point) is provided instead.
+    Returns [] when homography is None.
+    """
+    if homography_matrix is None or not regions or frame_w == 0:
+        return []
+
+    room_w, room_d = room_size_cm
+    bound_x = (-0.5 * room_w, 1.5 * room_w)
+    bound_y = (-0.5 * room_d, 1.5 * room_d)
+    result  = []
+
+    for region in regions:
+        x0 = region["nx"] * frame_w
+        y0 = region["ny"] * frame_h
+        x1 = (region["nx"] + region["nw"]) * frame_w
+        y1 = (region["ny"] + region["nh"]) * frame_h
+
+        corners_px = np.float32([[[x0, y0], [x1, y0], [x1, y1], [x0, y1]]])
+        corners_w  = cv2.perspectiveTransform(corners_px, homography_matrix)[0]
+
+        sane = all(
+            bound_x[0] <= float(cx) <= bound_x[1]
+            and bound_y[0] <= float(cy) <= bound_y[1]
+            for cx, cy in corners_w
+        )
+
+        if sane:
+            result.append({
+                "name":       region["name"],
+                "polygon_cm": [(float(cx), float(cy)) for cx, cy in corners_w],
+                "point_cm":   None,
+            })
+        else:
+            pt = cv2.perspectiveTransform(
+                np.float32([[[(x0 + x1) / 2.0, y1]]]), homography_matrix
+            )[0][0]
+            result.append({
+                "name":       region["name"],
+                "polygon_cm": None,
+                "point_cm":   (float(pt[0]), float(pt[1])),
+            })
+
+    return result
 
 
 # ---------------------------------------------------------------------------

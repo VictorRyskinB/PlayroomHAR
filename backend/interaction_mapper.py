@@ -1,4 +1,7 @@
 # backend/interaction_mapper.py
+# DEPRECATED (2026-07) — the object-interaction feature was removed from the
+# app.  Not imported by any live code path; kept for future reference/use.
+#
 # Determines child-object interactions from per-frame YOLO detections.
 #
 # Two detection methods (applied in priority order):

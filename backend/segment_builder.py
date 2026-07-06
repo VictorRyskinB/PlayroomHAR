@@ -1,4 +1,7 @@
 # backend/segment_builder.py
+# DEPRECATED (2026-07) — the object-interaction feature was removed from the
+# app.  Not imported by any live code path; kept for future reference/use.
+#
 # Converts per-frame interaction data into time-stamped segments and
 # into the normalized bounding-box format consumed by VideoPlayerWidget.
 #

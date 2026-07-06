@@ -56,6 +56,7 @@ class PathMapWidget(QWidget):
         self._homography:   np.ndarray | None = None   # 3×3 pixel→world matrix
         self._video_fw:     int = 0
         self._video_fh:     int = 0
+        self._blueprint:    QPixmap | None = None      # top-down room image
 
         self._show_path    = True
         self._show_heatmap = True
@@ -73,6 +74,19 @@ class PathMapWidget(QWidget):
     def set_room_size(self, width_cm: float, depth_cm: float):
         self._room_w = width_cm
         self._room_d = depth_cm
+        self.update()
+
+    def set_blueprint(self, image_path: str | None):
+        """
+        Load a top-down room image drawn under the path/heatmap.
+        Orient the image like this map: camera side at the BOTTOM.
+        Pass None to remove the blueprint.
+        """
+        if image_path:
+            pm = QPixmap(image_path)
+            self._blueprint = pm if not pm.isNull() else None
+        else:
+            self._blueprint = None
         self.update()
 
     def set_path(self, points: list[PathPoint]):
@@ -136,15 +150,24 @@ class PathMapWidget(QWidget):
         # Compute the room rectangle in widget space
         rx, ry, rw, rh = self._room_rect(w, h)
 
+        # ── Blueprint layer (under everything else) ──
+        if self._blueprint is not None:
+            painter.drawPixmap(
+                QRectF(rx, ry, rw, rh),
+                self._blueprint,
+                QRectF(self._blueprint.rect()),
+            )
+
         # ── Heatmap layer ──
         if self._show_heatmap and self._heatmap_rgba is not None:
             self._draw_heatmap(painter, rx, ry, rw, rh)
 
         # ── Room outline ──
+        overlay_present = self._blueprint is not None or (
+            self._heatmap_rgba is not None and self._show_heatmap
+        )
         painter.setPen(QPen(QColor("#556677"), 2))
-        painter.setBrush(QBrush(QColor(20, 30, 50,
-                                       0 if self._heatmap_rgba is not None
-                                          and self._show_heatmap else 40)))
+        painter.setBrush(QBrush(QColor(20, 30, 50, 0 if overlay_present else 40)))
         painter.drawRect(int(rx), int(ry), int(rw), int(rh))
 
         # Axis labels
@@ -293,7 +316,18 @@ class PathMapWidget(QWidget):
         painter: QPainter,
         rx: float, ry: float, rw: float, rh: float,
     ):
+        """
+        Draw each region's floor footprint: all 4 corners of the video-space
+        rectangle projected through the homography → a quadrilateral on the
+        map, clipped to the room.
+
+        Regions with vertical extent (walls, shelves) project their top edge
+        far toward/behind the horizon; when the projection blows up beyond a
+        sanity bound, fall back to a dot at the bottom-center floor point.
+        """
         import cv2
+        from PyQt6.QtGui import QPolygonF
+
         _COLORS = [
             (255, 100, 100), (100, 220, 100), (100, 140, 255), (255, 220, 50),
             (255, 100, 220), ( 80, 220, 220), (255, 160,  40), (180, 100, 255),
@@ -303,14 +337,57 @@ class PathMapWidget(QWidget):
         if fw == 0 or fh == 0:
             return
 
-        dot_r     = max(6, int(rw / 30))   # dot radius scales with map size
+        dot_r     = max(6, int(rw / 30))
         font_size = max(9, int(rw / 28))
         painter.setFont(QFont("Arial", font_size, QFont.Weight.Bold))
+
+        # Projections landing further out than this are treated as degenerate
+        # (region extends toward the image horizon).
+        bound_x = (-0.5 * self._room_w, 1.5 * self._room_w)
+        bound_y = (-0.5 * self._room_d, 1.5 * self._room_d)
 
         for idx, region in enumerate(self._regions):
             color = QColor(*_COLORS[idx % len(_COLORS)])
 
-            # Project the bottom-center of the region (where feet stand)
+            x0 = region["nx"] * fw
+            y0 = region["ny"] * fh
+            x1 = (region["nx"] + region["nw"]) * fw
+            y1 = (region["ny"] + region["nh"]) * fh
+            corners_px = np.float32([[
+                [x0, y0], [x1, y0], [x1, y1], [x0, y1],
+            ]])
+            corners_w = cv2.perspectiveTransform(corners_px, mat)[0]
+
+            sane = all(
+                bound_x[0] <= float(cx) <= bound_x[1]
+                and bound_y[0] <= float(cy) <= bound_y[1]
+                for cx, cy in corners_w
+            )
+
+            if sane:
+                poly = QPolygonF([
+                    self._world_to_widget(float(cx), float(cy), rx, ry, rw, rh)
+                    for cx, cy in corners_w
+                ])
+                # Clip to the room rectangle so partial overshoot stays tidy
+                painter.save()
+                painter.setClipRect(QRectF(rx, ry, rw, rh))
+                fill = QColor(color); fill.setAlpha(60)
+                painter.setBrush(QBrush(fill))
+                painter.setPen(QPen(color, 2, Qt.PenStyle.DashLine))
+                painter.drawPolygon(poly)
+                painter.restore()
+
+                # Label at the polygon centroid (clamped into the room)
+                cx = sum(p.x() for p in poly) / 4
+                cy = sum(p.y() for p in poly) / 4
+                cx = min(max(cx, rx + 4), rx + rw - 4)
+                cy = min(max(cy, ry + font_size), ry + rh - 4)
+                painter.setPen(QPen(Qt.GlobalColor.white))
+                painter.drawText(QPointF(cx, cy), region["name"])
+                continue
+
+            # ── Fallback: bottom-center floor dot (degenerate projection) ──
             cx_px = (region["nx"] + region["nw"] / 2) * fw
             cy_px = (region["ny"] + region["nh"]) * fh
             pt_w  = cv2.perspectiveTransform(
@@ -318,17 +395,11 @@ class PathMapWidget(QWidget):
             )
             x_cm, y_cm = float(pt_w[0][0][0]), float(pt_w[0][0][1])
             wpt = self._world_to_widget(x_cm, y_cm, rx, ry, rw, rh)
-
-            # Skip points that fall outside the room rectangle
             if not (rx <= wpt.x() <= rx + rw and ry <= wpt.y() <= ry + rh):
                 continue
-
-            # Filled circle
             painter.setBrush(QBrush(color))
             painter.setPen(QPen(Qt.GlobalColor.white, 1))
             painter.drawEllipse(wpt, dot_r, dot_r)
-
-            # Name label to the right of the dot
             painter.setPen(QPen(Qt.GlobalColor.white))
             painter.drawText(
                 QPointF(wpt.x() + dot_r + 3, wpt.y() + font_size // 2),

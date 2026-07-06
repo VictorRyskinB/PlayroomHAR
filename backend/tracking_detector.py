@@ -46,9 +46,11 @@ class TrackingDetector:
         self,
         model_name: str = "yolov8n.pt",
         conf_threshold: float = 0.25,
+        frame_stride: int = 1,
     ):
         self._model_name = model_name
         self._conf       = conf_threshold
+        self._stride     = max(1, frame_stride)
         self._model      = None
 
     def _load_model(self):
@@ -76,12 +78,15 @@ class TrackingDetector:
         last_pct  = -1
 
         # stream=True → generator; persist=True → tracker keeps state
+        # vid_stride=N → ultralytics reads every Nth frame; the generator only
+        # yields sampled frames, so the true frame index is yield_count * N.
         stream = self._model.track(
             source=video_path,
             stream=True,
             persist=True,
             conf=self._conf,
             classes=[0],      # 0 = person in COCO
+            vid_stride=self._stride,
             verbose=False,
         )
 
@@ -104,9 +109,9 @@ class TrackingDetector:
                     )
                     tracks.setdefault(tid, []).append(pt)
 
-            frame_idx += 1
+            frame_idx += self._stride
             if progress_cb and total > 0:
-                pct = int(frame_idx / total * 100)
+                pct = min(100, int(frame_idx / total * 100))
                 if pct != last_pct:
                     progress_cb(pct)
                     last_pct = pct

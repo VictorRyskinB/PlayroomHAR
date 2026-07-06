@@ -218,8 +218,11 @@ class VideoPlayerWidget(QWidget):
     region_drawn       = pyqtSignal(float, float, float, float)   # nx, ny, nw, nh
     calibration_click  = pyqtSignal(float, float)                  # nx, ny
 
+    _VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv", ".wmv"}
+
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.setAcceptDrops(True)
         self._cap = None
         self._total_frames = 0
         self._fps = 30.0
@@ -307,6 +310,21 @@ class VideoPlayerWidget(QWidget):
         controls.addStretch()
         controls.addWidget(self._time_label)
         root.addLayout(controls)
+
+    # ------------------------------------------------------------------ drag & drop
+
+    def dragEnterEvent(self, event):
+        urls = event.mimeData().urls()
+        if urls and urls[0].isLocalFile():
+            from pathlib import Path as _P
+            if _P(urls[0].toLocalFile()).suffix.lower() in self._VIDEO_EXTS:
+                event.acceptProposedAction()
+
+    def dropEvent(self, event):
+        urls = event.mimeData().urls()
+        if urls and urls[0].isLocalFile():
+            self.load_video(urls[0].toLocalFile())
+            event.acceptProposedAction()
 
     # ------------------------------------------------------------------ public API
 

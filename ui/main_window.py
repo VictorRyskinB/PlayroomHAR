@@ -27,7 +27,7 @@ from PyQt6.QtWidgets import (
     QScrollArea,
     QButtonGroup, QRadioButton,
     QStackedWidget, QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
-    QGridLayout, QSizePolicy, QListWidget, QListWidgetItem,
+    QGridLayout, QSizePolicy, QListWidget, QListWidgetItem, QGroupBox,
 )
 
 from ui.video_player import VideoPlayerWidget
@@ -230,18 +230,34 @@ class _UserGuideDialog(QDialog):
 
     _GUIDE_HTML = """
 <h2>Getting Started</h2>
+<p>The step bar under the toolbar shows the workflow:
+<b>1 Open video → 2 Calibrate camera → 3 Run All → 4 Analysis</b>.
+Completed steps get a green check; the suggested next step is highlighted.
+Each step is clickable.</p>
 <ul>
-<li>Open any video file (MP4, AVI, MOV, etc.).</li>
+<li>Open any video file via <b>File → Open Video…</b> or drag &amp; drop it onto
+the player (MP4, AVI, MOV, etc.).</li>
 <li>If results from a previous session exist (a <code>_results.json</code> file next to
 the video), they load automatically.</li>
-<li>The last-used regions file is auto-loaded on startup.</li>
+<li>The last-used regions file and blueprint are auto-loaded on startup.</li>
 </ul>
+
+<h2>Room Setup and Profiles</h2>
+<p>Everything configured once per room/camera lives in <b>Room Setup…</b>
+(toolbar button or Setup menu): camera calibration, regions, blueprint, and
+YOLO-World classes. The dialog is non-modal — keep it open while drawing
+regions on the video.</p>
+<p>A <b>room profile</b> bundles the current calibration + regions + blueprint
+under one name (<b>Save Profile…</b> in Room Setup). Pick a profile from the
+<b>Room:</b> dropdown in the toolbar to apply all three at once. Every
+component can still be changed individually at any time &mdash; the profile
+then shows <i>modified</i> until you save it again (or save as a new one).</p>
 
 <h2>First-Time Camera Setup</h2>
 <p><b>Before Track Path gives meaningful results</b>, you need to calibrate the camera.</p>
 <ol>
-<li>Click <b>Calibrate Camera</b> &mdash; it asks for the room width and depth in
-centimetres.</li>
+<li>Open <b>Room Setup…</b> and click <b>Calibrate new…</b> (or click step 2 in
+the step bar) &mdash; it asks for the room width and depth in centimetres.</li>
 <li>You then click 4 known floor points in the video frame and type their
 real-world X, Y positions (in cm).</li>
 <li>The coordinate system: origin = front-left corner (camera side, left),
@@ -249,13 +265,17 @@ real-world X, Y positions (in cm).</li>
 </ol>
 <p>Calibration is saved automatically as a <code>.homography.json</code> file next to the
 video &mdash; it auto-loads next time you open that video.</p>
-<p>The <b>calibration dropdown</b> (Path &amp; Heatmap tab) lists recently used
+<p>The <b>calibration dropdown</b> (Room Setup) lists recently used
 calibrations &mdash; pick one to reuse it for a video from the same camera.
 <b>Load Cal&hellip;</b> adds a calibration file to that list (useful after a
 re-install or on a new PC). <b>Save Cal&hellip;</b> exports the current one.</p>
 <p><b>Changing the calibration instantly reprojects the loaded path</b> &mdash; no
-re-run of Track Path is needed. If a video has no calibration file beside it,
-no calibration is applied (one from a previous video is never silently reused).</p>
+re-run of Track Path is needed.</p>
+<p><b>Which calibration applies when a video opens:</b> a calibration you chose
+deliberately (room profile, dropdown, Load Cal, or a fresh calibration) stays
+active across videos. Only when none is chosen does the video's own
+<code>.homography.json</code> auto-load &mdash; and with nothing at all, no
+calibration is applied (one is never silently inherited).</p>
 <p><b>Without calibration:</b> Track Path still works (you get a path and point count),
 but distances, speeds, episodes, and coverage will show &ldquo;no calibration&rdquo;.</p>
 
@@ -308,10 +328,10 @@ or delete individual ones without redrawing the rest. Remember to
 <b>Save Regions&hellip;</b> afterwards to persist the changes.</li>
 <li>Regions are stored in normalised coordinates (resolution-independent) &mdash; the
 same config works for any video from that camera.</li>
-<li>The <b>regions dropdown</b> lists recently used configs &mdash; pick one to apply
-it instantly. <b>Load Regions&hellip;</b> adds a config file to the list;
-<b>Save Regions&hellip;</b> writes the current regions to a
-<code>.regions.json</code> file. The last-used config auto-reloads on launch.</li>
+<li>The <b>regions dropdown</b> (Room Setup) lists recently used configs &mdash;
+pick one to apply it instantly. <b>Load…</b> adds a config file to the list;
+<b>Save…</b> writes the current regions to a <code>.regions.json</code> file.
+The last-used config auto-reloads on launch.</li>
 <li>The <b>Regions tab</b> shows time segments where the child was inside each
 region. Once Track Path has run, these segments come from the tracked path
 (same definition as the Analysis panel, so the numbers match); before that,
@@ -328,9 +348,10 @@ Dotted segments = interpolated frames.</li>
 (requires calibration).</li>
 <li><b>Live path</b> &mdash; When enabled, the map shows the path up to the current
 video playhead position. Scrub the video to watch the path grow.</li>
-<li><b>Blueprint&hellip;</b> &mdash; Load a top-down room image drawn under the path
-and heatmap (orient it with the camera side at the bottom). It is remembered
-across sessions and embedded in the Excel report. The &#10005; button removes it.</li>
+<li><b>Blueprint&hellip;</b> (Room Setup) &mdash; Load a top-down room image drawn
+under the path and heatmap (orient it with the camera side at the bottom). It is
+remembered across sessions and embedded in the Excel report. The &#10005; button
+removes it.</li>
 <li><b>Export Path CSV</b> &mdash; Exports raw path points (frame, timestamp, pixel
 coords, world coords).</li>
 </ul>
@@ -901,6 +922,17 @@ class MainWindow(QMainWindow):
         # Blueprint image drawn under the path map (per-room, persisted)
         self._blueprint_path: str | None = None
 
+        # Room profile state — a profile is a loose bundle of the three
+        # room components; each stays individually swappable at any time.
+        self._current_profile_path: str | None = None
+        self._current_cal_path:     str | None = None
+        self._current_regions_path: str | None = None
+        self._applying_profile: bool = False   # suppress dirty-marking
+        # True when the calibration was chosen deliberately (profile, dropdown,
+        # Load Cal, or a fresh calibration) — such a choice survives video
+        # loads instead of being replaced by the video's own homography file.
+        self._cal_explicit: bool = False
+
         # Analysis panel state
         self._analysis_smooth_window: int   = 5     # smoothing window (frames)
         self._analysis_stat_thresh:   float = 0.10  # stationary threshold (m/s)
@@ -921,6 +953,7 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._refresh_cal_combo()
         self._refresh_regions_combo()
+        self._refresh_profile_combo()
         self._load_settings()
         # Re-apply stylesheet so saved font/theme preferences take effect on startup
         self.setStyleSheet(_make_qss(self._font_size, self._theme_name))
@@ -936,7 +969,33 @@ class MainWindow(QMainWindow):
         root.setContentsMargins(8, 8, 8, 4)
         root.setSpacing(0)
 
-        # ── Toolbar row 1: title + action buttons ──
+        # ── Menu bar ──
+        menubar   = self.menuBar()
+        file_menu = menubar.addMenu("&File")
+        open_act = file_menu.addAction("Open Video…")
+        open_act.triggered.connect(lambda: self._video.open_file_dialog())
+        self._load_json_act = file_menu.addAction("Load Results JSON…")
+        self._load_json_act.triggered.connect(self._load_json_dialog)
+        file_menu.addSeparator()
+        export_csv_act = file_menu.addAction("Export Path CSV…")
+        export_csv_act.triggered.connect(self._export_path_csv)
+        export_xlsx_act = file_menu.addAction("Export Excel Report…")
+        export_xlsx_act.triggered.connect(self._export_analysis_xlsx)
+        file_menu.addSeparator()
+        exit_act = file_menu.addAction("Exit")
+        exit_act.triggered.connect(self.close)
+
+        setup_menu = menubar.addMenu("&Setup")
+        room_act = setup_menu.addAction("Room Setup…")
+        room_act.triggered.connect(self._show_room_setup)
+        appearance_act = setup_menu.addAction("Appearance…")
+        appearance_act.triggered.connect(self._open_config_dialog)
+
+        help_menu = menubar.addMenu("&Help")
+        guide_act = help_menu.addAction("User Guide")
+        guide_act.triggered.connect(self._show_user_guide)
+
+        # ── Toolbar row 1: title + room profile + run actions ──
         toolbar = QHBoxLayout()
         toolbar.setContentsMargins(0, 4, 0, 4)
         toolbar.setSpacing(6)
@@ -957,18 +1016,6 @@ class MainWindow(QMainWindow):
         )
         self._track_path_btn.clicked.connect(self._run_path_tracking)
 
-        self._calibrate_btn = QPushButton("Calibrate Camera…")
-        self._calibrate_btn.setEnabled(False)
-        self._calibrate_btn.setToolTip(
-            "Click 4 known floor points to set up the perspective transform.\n"
-            "Required for the top-down path map and real-world distances."
-        )
-        self._calibrate_btn.clicked.connect(self._start_calibration)
-
-        self._load_json_btn = QPushButton("Load JSON…")
-        self._load_json_btn.setToolTip("Load a previously saved _results.json")
-        self._load_json_btn.clicked.connect(self._load_json_dialog)
-
         self._progress    = QProgressBar()
         self._progress.setRange(0, 100)
         self._progress.setFixedWidth(160)
@@ -979,6 +1026,41 @@ class MainWindow(QMainWindow):
         self._phase_label.setVisible(False)
 
         toolbar.addWidget(app_title)
+        toolbar.addSpacing(16)
+
+        room_lbl = QLabel("Room:")
+        room_lbl.setStyleSheet("font-size:11px; color:#99aacc;")
+        toolbar.addWidget(room_lbl)
+        self._profile_combo = QComboBox()
+        self._profile_combo.setFixedWidth(150)
+        self._profile_combo.setToolTip(
+            "Room profile — one named bundle of calibration + regions + blueprint.\n"
+            "Each component can still be changed individually at any time\n"
+            "(the profile then shows as modified). Save profiles in Room Setup."
+        )
+        self._profile_combo.currentIndexChanged.connect(
+            self._on_profile_combo_changed
+        )
+        toolbar.addWidget(self._profile_combo)
+        self._profile_dirty_lbl = QLabel("modified")
+        self._profile_dirty_lbl.setStyleSheet(
+            "font-size:10px; color:#ddaa44; font-style:italic;"
+        )
+        self._profile_dirty_lbl.setToolTip(
+            "A component (calibration / regions / blueprint) differs from the\n"
+            "saved profile. Use Room Setup → Save Profile… to update it."
+        )
+        self._profile_dirty_lbl.setVisible(False)
+        toolbar.addWidget(self._profile_dirty_lbl)
+
+        self._room_setup_btn = QPushButton("Room Setup…")
+        self._room_setup_btn.setToolTip(
+            "Calibration, regions, blueprint, YOLO-World classes —\n"
+            "everything configured once per room lives here."
+        )
+        self._room_setup_btn.clicked.connect(self._show_room_setup)
+        toolbar.addWidget(self._room_setup_btn)
+
         toolbar.addStretch()
         self._run_all_btn = QPushButton("▶▶  Run All")
         self._run_all_btn.setEnabled(False)
@@ -992,8 +1074,6 @@ class MainWindow(QMainWindow):
         toolbar.addWidget(self._run_all_btn)
         toolbar.addWidget(self._yolo_btn)
         toolbar.addWidget(self._track_path_btn)
-        toolbar.addWidget(self._calibrate_btn)
-        toolbar.addWidget(self._load_json_btn)
         self._analysis_btn = QPushButton("📊 Analysis")
         self._analysis_btn.setEnabled(False)
         self._analysis_btn.setToolTip(
@@ -1003,16 +1083,6 @@ class MainWindow(QMainWindow):
         )
         self._analysis_btn.clicked.connect(self._show_analysis_panel)
         toolbar.addWidget(self._analysis_btn)
-        self._config_btn = QPushButton("Aa")
-        self._config_btn.setFixedWidth(34)
-        self._config_btn.setToolTip("Font size, color theme, recognition window settings")
-        self._config_btn.clicked.connect(self._open_config_dialog)
-        toolbar.addWidget(self._config_btn)
-        self._help_btn = QPushButton("?")
-        self._help_btn.setFixedWidth(34)
-        self._help_btn.setToolTip("Open user guide")
-        self._help_btn.clicked.connect(self._show_user_guide)
-        toolbar.addWidget(self._help_btn)
         self._cancel_btn = QPushButton("✕  Cancel")
         self._cancel_btn.setVisible(False)
         self._cancel_btn.setStyleSheet(
@@ -1030,6 +1100,31 @@ class MainWindow(QMainWindow):
         toolbar.addWidget(self._progress)
         toolbar.addWidget(self._cancel_btn)
         root.addLayout(toolbar)
+
+        # ── Workflow step indicator ──
+        steps_row = QHBoxLayout()
+        steps_row.setContentsMargins(0, 0, 0, 4)
+        steps_row.setSpacing(4)
+        self._step_btns: list[QPushButton] = []
+        step_defs = [
+            ("1  Open video",        lambda: self._video.open_file_dialog()),
+            ("2  Calibrate camera",  self._start_calibration),
+            ("3  Run All",           self._run_all),
+            ("4  Analysis",          self._show_analysis_panel),
+        ]
+        for i, (text, slot) in enumerate(step_defs):
+            btn = QPushButton(text)
+            btn.setFlat(True)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.clicked.connect(slot)
+            steps_row.addWidget(btn)
+            self._step_btns.append(btn)
+            if i < len(step_defs) - 1:
+                arrow = QLabel("→")
+                arrow.setStyleSheet("color:#556; font-size:11px;")
+                steps_row.addWidget(arrow)
+        steps_row.addStretch()
+        root.addLayout(steps_row)
 
         # ── Toolbar row 2: live filter parameters ──
         parambar_frame = QFrame()
@@ -1111,106 +1206,24 @@ class MainWindow(QMainWindow):
             lambda s: self._video.set_trail_visible(bool(s))
         )
 
-        parambar.addWidget(self._all_classes_chk)
-        parambar.addSpacing(8)
-        parambar.addWidget(_param_label("Sample every"))
-        parambar.addWidget(self._sample_spin)
-        parambar.addWidget(_param_label("frame(s)"))
-        parambar.addSpacing(16)
-        parambar.addWidget(_param_label("YOLO conf ≥"))
-        parambar.addWidget(self._conf_spin)
-        parambar.addSpacing(8)
-        parambar.addWidget(_param_label("Min duration ≥"))
-        parambar.addWidget(self._min_dur_spin)
-        parambar.addWidget(_param_label("s"))
-        parambar.addSpacing(12)
-        parambar.addWidget(self._yolo_vis_chk)
-        parambar.addWidget(self._person_only_chk)
-        parambar.addWidget(self._trail_vis_chk)
-        parambar.addStretch()
-        root.addWidget(parambar_frame)
-
-        # ── Toolbar row 3: model selection ──
-        modelbar_frame = QFrame()
-        modelbar_frame.setObjectName("parambar")
-        modelbar = QHBoxLayout(modelbar_frame)
-        modelbar.setContentsMargins(6, 4, 6, 4)
-        modelbar.setSpacing(8)
-
-        def _model_label(text):
-            lbl = QLabel(text)
-            lbl.setStyleSheet("font-size:11px; color:#99aacc;")
-            return lbl
-
-        # ── YOLO model combo ──
+        # ── YOLO model combo (lives in the parambar run-settings section) ──
         self._yolo_model_combo = QComboBox()
         from backend.yolo_detector import YOLO_MODEL_OPTIONS
         self._yolo_model_display = list(YOLO_MODEL_OPTIONS.keys())   # ordered
         for display_name in self._yolo_model_display:
             self._yolo_model_combo.addItem(display_name)
         self._yolo_model_combo.setCurrentIndex(0)
-        self._yolo_model_combo.setFixedWidth(170)
+        self._yolo_model_combo.setFixedWidth(150)
         self._yolo_model_combo.setToolTip(
-            "YOLO model used by Run YOLO and Run Full Analysis.\n"
+            "YOLO model used by every run.\n"
             "Larger models are slower but detect more accurately.\n"
-            "YOLO-World uses an open vocabulary — set custom class names below."
+            "YOLO-World uses an open vocabulary — set class names in Room Setup."
         )
         self._yolo_model_combo.currentIndexChanged.connect(
             self._on_yolo_model_changed
         )
 
-        modelbar.addWidget(_model_label("YOLO model:"))
-        modelbar.addWidget(self._yolo_model_combo)
-        modelbar.addStretch()
-        root.addWidget(modelbar_frame)
-
-        # ── YOLO-World classes row (hidden unless YOLO-World is selected) ──
-        self._world_frame = QFrame()
-        self._world_frame.setObjectName("regionbar")
-        world_layout = QHBoxLayout(self._world_frame)
-        world_layout.setContentsMargins(6, 4, 6, 4)
-        world_layout.setSpacing(6)
-
-        world_lbl = QLabel("YOLO-World classes:")
-        world_lbl.setStyleSheet("font-size:11px; color:#88bb88;")
-
-        self._world_classes_edit = QLineEdit()
-        self._world_classes_edit.setPlaceholderText(
-            "e.g.  toy, ball, slinky, book, crayon, …"
-        )
-        self._world_classes_edit.setToolTip(
-            "Comma-separated list of objects YOLO-World should detect.\n"
-            "Plain English nouns work best (e.g. 'building block', not 'block_toy').\n"
-            "Changes take effect on the next Run."
-        )
-        self._world_classes_edit.setText(", ".join(self._world_classes))
-        self._world_classes_edit.textChanged.connect(self._on_world_classes_changed)
-
-        self._save_classes_btn = QPushButton("Save Classes…")
-        self._save_classes_btn.clicked.connect(self._save_classes_dialog)
-
-        self._load_classes_btn = QPushButton("Load Classes…")
-        self._load_classes_btn.clicked.connect(self._load_classes_dialog)
-
-        world_layout.addWidget(world_lbl)
-        world_layout.addWidget(self._world_classes_edit, stretch=1)
-        world_layout.addWidget(self._save_classes_btn)
-        world_layout.addWidget(self._load_classes_btn)
-        self._world_frame.setVisible(False)   # hidden until YOLO-World selected
-        root.addWidget(self._world_frame)
-
-        # ── Toolbar row 4: region capture ──
-        regionbar_frame = QFrame()
-        regionbar_frame.setObjectName("regionbar")
-        regionbar = QHBoxLayout(regionbar_frame)
-        regionbar.setContentsMargins(6, 4, 6, 4)
-        regionbar.setSpacing(6)
-
-        def _region_label(text):
-            lbl = QLabel(text)
-            lbl.setStyleSheet("font-size:11px; color:#88bb88;")
-            return lbl
-
+        # ── Region quick controls (full region management is in Room Setup) ──
         self._edit_regions_btn = QPushButton("✏  Edit Regions")
         self._edit_regions_btn.setObjectName("editRegionsBtn")
         self._edit_regions_btn.setCheckable(True)
@@ -1219,24 +1232,11 @@ class MainWindow(QMainWindow):
         self._edit_regions_btn.setToolTip(
             "Toggle region drawing mode.\n"
             "Drag a rectangle on the video frame to add a named region.\n"
-            "Regions are saved per camera/room in a .regions.json file."
+            "Manage / save / load region configs in Room Setup."
         )
         self._edit_regions_btn.toggled.connect(self._on_edit_regions_toggled)
 
-        self._region_count_lbl = QLabel("0 regions")
-        self._region_count_lbl.setStyleSheet("font-size:11px; color:#88bb88;")
-
-        self._regions_combo = QComboBox()
-        self._regions_combo.setFixedWidth(150)
-        self._regions_combo.setToolTip(
-            "Quick-pick a recently used region config.\n"
-            "Use 'Load Regions…' to add a config file to this list."
-        )
-        self._regions_combo.currentIndexChanged.connect(
-            self._on_regions_combo_changed
-        )
-
-        self._regions_vis_chk = QCheckBox("Show")
+        self._regions_vis_chk = QCheckBox("Regions")
         self._regions_vis_chk.setChecked(True)
         self._regions_vis_chk.setStyleSheet("font-size:11px;")
         self._regions_vis_chk.setToolTip("Toggle region overlay visibility")
@@ -1244,53 +1244,56 @@ class MainWindow(QMainWindow):
             lambda s: self._video.set_regions_visible(bool(s))
         )
 
-        self._manage_regions_btn = QPushButton("Manage…")
-        self._manage_regions_btn.setEnabled(False)
-        self._manage_regions_btn.setToolTip(
-            "Rename or delete individual regions."
-        )
-        self._manage_regions_btn.clicked.connect(self._open_region_manager)
+        def _sep():
+            s = QFrame()
+            s.setFrameShape(QFrame.Shape.VLine)
+            s.setStyleSheet("color:#3a3a5a;")
+            return s
 
-        self._clear_regions_btn = QPushButton("Clear")
-        self._clear_regions_btn.setEnabled(False)
-        self._clear_regions_btn.setToolTip("Remove all regions")
-        self._clear_regions_btn.clicked.connect(self._clear_regions)
+        def _section_label(text):
+            lbl = QLabel(text)
+            lbl.setStyleSheet(
+                "font-size:9px; color:#667; font-weight:bold; letter-spacing:1px;"
+            )
+            return lbl
 
-        self._save_regions_btn = QPushButton("Save Regions…")
-        self._save_regions_btn.setEnabled(False)
-        self._save_regions_btn.setToolTip(
-            "Save current regions to a .regions.json file.\n"
-            "Each file is specific to a camera/room setup."
-        )
-        self._save_regions_btn.clicked.connect(self._save_regions_dialog)
-
-        self._load_regions_btn = QPushButton("Load Regions…")
-        self._load_regions_btn.setEnabled(False)
-        self._load_regions_btn.setToolTip(
-            "Load a previously saved .regions.json file."
-        )
-        self._load_regions_btn.clicked.connect(self._load_regions_dialog)
-
-        regionbar.addWidget(_region_label("Regions:"))
-        regionbar.addWidget(self._regions_combo)
-        regionbar.addWidget(self._edit_regions_btn)
-        regionbar.addWidget(self._region_count_lbl)
-        regionbar.addWidget(self._regions_vis_chk)
-        regionbar.addSpacing(8)
-        regionbar.addWidget(self._manage_regions_btn)
-        regionbar.addWidget(self._clear_regions_btn)
-        regionbar.addWidget(self._save_regions_btn)
-        regionbar.addWidget(self._load_regions_btn)
-        regionbar.addStretch()
-        root.addWidget(regionbar_frame)
+        parambar.addWidget(_section_label("RUN"))
+        parambar.addWidget(self._yolo_model_combo)
+        parambar.addWidget(self._all_classes_chk)
+        parambar.addWidget(_param_label("Sample every"))
+        parambar.addWidget(self._sample_spin)
+        parambar.addWidget(_param_label("frame(s)"))
+        parambar.addSpacing(10)
+        parambar.addWidget(_sep())
+        parambar.addSpacing(10)
+        parambar.addWidget(_section_label("LIVE FILTERS"))
+        parambar.addWidget(_param_label("YOLO conf ≥"))
+        parambar.addWidget(self._conf_spin)
+        parambar.addWidget(_param_label("Min duration ≥"))
+        parambar.addWidget(self._min_dur_spin)
+        parambar.addWidget(_param_label("s"))
+        parambar.addSpacing(10)
+        parambar.addWidget(_sep())
+        parambar.addSpacing(10)
+        parambar.addWidget(_section_label("OVERLAYS"))
+        parambar.addWidget(self._yolo_vis_chk)
+        parambar.addWidget(self._person_only_chk)
+        parambar.addWidget(self._trail_vis_chk)
+        parambar.addWidget(self._regions_vis_chk)
+        parambar.addSpacing(8)
+        parambar.addWidget(self._edit_regions_btn)
+        parambar.addStretch()
+        root.addWidget(parambar_frame)
         root.addSpacing(4)
 
-        # ── Results source label ──
+        # ── Room Setup dialog (non-modal; owns all once-per-room controls) ──
+        self._build_room_setup_dialog()
+
+        # ── Results source label (docked into the status bar below) ──
         self._source_label = QLabel("")
         self._source_label.setStyleSheet(
             "color:#7799cc; font-size:10px; padding: 2px 2px;"
         )
-        root.addWidget(self._source_label)
 
         # ── Content splitter ──
         self._splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -1346,47 +1349,6 @@ class MainWindow(QMainWindow):
         self._path_cal_status_lbl = QLabel("No calibration")
         self._path_cal_status_lbl.setStyleSheet("font-size:10px; color:#8899aa;")
 
-        self._cal_combo = QComboBox()
-        self._cal_combo.setFixedWidth(150)
-        self._cal_combo.setToolTip(
-            "Quick-pick a recently used calibration.\n"
-            "Applying one instantly reprojects the loaded path — no re-run needed.\n"
-            "Use 'Load Cal…' to add a calibration file to this list."
-        )
-        self._cal_combo.currentIndexChanged.connect(self._on_cal_combo_changed)
-
-        self._save_cal_btn = QPushButton("Save Cal…")
-        self._save_cal_btn.setFixedWidth(90)
-        self._save_cal_btn.setToolTip(
-            "Save the current homography calibration to a chosen file.\n"
-            "Useful when you have multiple cameras or room setups."
-        )
-        self._save_cal_btn.clicked.connect(self._save_cal_dialog)
-
-        self._load_cal_btn = QPushButton("Load Cal…")
-        self._load_cal_btn.setFixedWidth(90)
-        self._load_cal_btn.setToolTip(
-            "Load a homography calibration file from any location."
-        )
-        self._load_cal_btn.clicked.connect(self._load_cal_dialog)
-
-        self._blueprint_btn = QPushButton("Blueprint…")
-        self._blueprint_btn.setFixedWidth(90)
-        self._blueprint_btn.setToolTip(
-            "Load a top-down room image drawn under the path and heatmap.\n"
-            "Orient it like this map: camera side at the bottom.\n"
-            "Also embedded in the Excel report."
-        )
-        self._blueprint_btn.clicked.connect(self._load_blueprint_dialog)
-
-        self._clear_blueprint_btn = QPushButton("✕")
-        self._clear_blueprint_btn.setFixedWidth(24)
-        self._clear_blueprint_btn.setToolTip("Remove the blueprint image")
-        self._clear_blueprint_btn.setVisible(False)
-        self._clear_blueprint_btn.clicked.connect(
-            lambda: self._set_blueprint(None)
-        )
-
         self._path_show_regions_chk = QCheckBox("Regions")
         self._path_show_regions_chk.setChecked(True)
         self._path_show_regions_chk.setStyleSheet("font-size:11px;")
@@ -1410,12 +1372,6 @@ class MainWindow(QMainWindow):
         _path_toggle_row.addWidget(self._path_live_chk)
         _path_toggle_row.addStretch()
         _path_toggle_row.addWidget(self._path_cal_status_lbl)
-        _path_toggle_row.addSpacing(8)
-        _path_toggle_row.addWidget(self._cal_combo)
-        _path_toggle_row.addWidget(self._save_cal_btn)
-        _path_toggle_row.addWidget(self._load_cal_btn)
-        _path_toggle_row.addWidget(self._blueprint_btn)
-        _path_toggle_row.addWidget(self._clear_blueprint_btn)
         _path_tab_layout.addLayout(_path_toggle_row)
 
         # Stats + export row
@@ -1462,7 +1418,218 @@ class MainWindow(QMainWindow):
         self._status = QStatusBar()
         self._status.setStyleSheet("color:#888; font-size:11px;")
         self.setStatusBar(self._status)
+        # Filter/results summary docks on the right; transient messages left
+        self._status.addPermanentWidget(self._source_label)
         self._status.showMessage("Ready — open a video file to begin.")
+        self._update_steps()
+
+    # ------------------------------------------------------------------ room setup dialog
+
+    def _build_room_setup_dialog(self):
+        """
+        Non-modal dialog holding everything configured once per room:
+        calibration, regions, blueprint, YOLO-World classes, and the profile
+        save button.  Non-modal so region drawing works while it is open.
+        Widget attribute names are unchanged from the old toolbar rows, so
+        every existing handler keeps working.
+        """
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Room Setup")
+        dlg.setModal(False)
+        dlg.setMinimumWidth(520)
+        self._room_setup_dlg = dlg
+        vbox = QVBoxLayout(dlg)
+        vbox.setSpacing(10)
+
+        hint = QLabel(
+            "Everything here is configured once per room/camera and reused "
+            "across videos.\nBundle the current combination into a named "
+            "profile with 'Save Profile…'."
+        )
+        hint.setStyleSheet("font-size:10px; color:#8899aa;")
+        hint.setWordWrap(True)
+        vbox.addWidget(hint)
+
+        # ── Calibration group ──
+        cal_group = QGroupBox("Camera calibration")
+        cal_lay = QHBoxLayout(cal_group)
+        self._cal_combo = QComboBox()
+        self._cal_combo.setMinimumWidth(150)
+        self._cal_combo.setToolTip(
+            "Quick-pick a recently used calibration.\n"
+            "Applying one instantly reprojects the loaded path — no re-run needed."
+        )
+        self._cal_combo.currentIndexChanged.connect(self._on_cal_combo_changed)
+        self._calibrate_btn = QPushButton("Calibrate new…")
+        self._calibrate_btn.setEnabled(False)
+        self._calibrate_btn.setToolTip(
+            "Click 4 known floor points in the video to set up the\n"
+            "perspective transform. Requires a loaded video."
+        )
+        self._calibrate_btn.clicked.connect(self._start_calibration)
+        self._save_cal_btn = QPushButton("Save Cal…")
+        self._save_cal_btn.setToolTip(
+            "Save the current homography calibration to a chosen file."
+        )
+        self._save_cal_btn.clicked.connect(self._save_cal_dialog)
+        self._load_cal_btn = QPushButton("Load Cal…")
+        self._load_cal_btn.setToolTip(
+            "Load a homography calibration file (adds it to the dropdown)."
+        )
+        self._load_cal_btn.clicked.connect(self._load_cal_dialog)
+        cal_lay.addWidget(self._cal_combo, stretch=1)
+        cal_lay.addWidget(self._calibrate_btn)
+        cal_lay.addWidget(self._save_cal_btn)
+        cal_lay.addWidget(self._load_cal_btn)
+        vbox.addWidget(cal_group)
+
+        # ── Regions group ──
+        reg_group = QGroupBox("Regions")
+        reg_outer = QVBoxLayout(reg_group)
+        reg_lay = QHBoxLayout()
+        self._regions_combo = QComboBox()
+        self._regions_combo.setMinimumWidth(150)
+        self._regions_combo.setToolTip(
+            "Quick-pick a recently used region config."
+        )
+        self._regions_combo.currentIndexChanged.connect(
+            self._on_regions_combo_changed
+        )
+        self._region_count_lbl = QLabel("0 regions")
+        self._region_count_lbl.setStyleSheet("font-size:11px; color:#88bb88;")
+        self._manage_regions_btn = QPushButton("Manage…")
+        self._manage_regions_btn.setEnabled(False)
+        self._manage_regions_btn.setToolTip(
+            "Rename or delete individual regions."
+        )
+        self._manage_regions_btn.clicked.connect(self._open_region_manager)
+        self._clear_regions_btn = QPushButton("Clear")
+        self._clear_regions_btn.setEnabled(False)
+        self._clear_regions_btn.setToolTip("Remove all regions")
+        self._clear_regions_btn.clicked.connect(self._clear_regions)
+        self._save_regions_btn = QPushButton("Save…")
+        self._save_regions_btn.setEnabled(False)
+        self._save_regions_btn.setToolTip(
+            "Save current regions to a .regions.json file."
+        )
+        self._save_regions_btn.clicked.connect(self._save_regions_dialog)
+        self._load_regions_btn = QPushButton("Load…")
+        self._load_regions_btn.setToolTip(
+            "Load a .regions.json file (adds it to the dropdown)."
+        )
+        self._load_regions_btn.clicked.connect(self._load_regions_dialog)
+        reg_lay.addWidget(self._regions_combo, stretch=1)
+        reg_lay.addWidget(self._region_count_lbl)
+        reg_lay.addWidget(self._manage_regions_btn)
+        reg_lay.addWidget(self._clear_regions_btn)
+        reg_lay.addWidget(self._save_regions_btn)
+        reg_lay.addWidget(self._load_regions_btn)
+        reg_hint = QLabel(
+            "Draw new regions with '✏ Edit Regions' in the main window "
+            "(this dialog can stay open)."
+        )
+        reg_hint.setStyleSheet("font-size:10px; color:#8899aa;")
+        reg_outer.addLayout(reg_lay)
+        reg_outer.addWidget(reg_hint)
+        vbox.addWidget(reg_group)
+
+        # ── Blueprint group ──
+        bp_group = QGroupBox("Blueprint")
+        bp_lay = QHBoxLayout(bp_group)
+        self._blueprint_btn = QPushButton("Blueprint…")
+        self._blueprint_btn.setToolTip(
+            "Load a top-down room image drawn under the path and heatmap.\n"
+            "Orient it like the map: camera side at the bottom.\n"
+            "Also embedded in the Excel report."
+        )
+        self._blueprint_btn.clicked.connect(self._load_blueprint_dialog)
+        self._clear_blueprint_btn = QPushButton("✕")
+        self._clear_blueprint_btn.setFixedWidth(24)
+        self._clear_blueprint_btn.setToolTip("Remove the blueprint image")
+        self._clear_blueprint_btn.setVisible(False)
+        self._clear_blueprint_btn.clicked.connect(
+            lambda: self._set_blueprint(None)
+        )
+        bp_lay.addWidget(self._blueprint_btn)
+        bp_lay.addWidget(self._clear_blueprint_btn)
+        bp_lay.addStretch()
+        vbox.addWidget(bp_group)
+
+        # ── YOLO-World classes group ──
+        self._world_frame = QGroupBox("YOLO-World classes")
+        world_outer = QVBoxLayout(self._world_frame)
+        self._world_classes_edit = QLineEdit()
+        self._world_classes_edit.setPlaceholderText(
+            "e.g.  toy, ball, slinky, book, crayon, …"
+        )
+        self._world_classes_edit.setToolTip(
+            "Comma-separated list of objects YOLO-World should detect.\n"
+            "Plain English nouns work best. Takes effect on the next Run."
+        )
+        self._world_classes_edit.setText(", ".join(self._world_classes))
+        self._world_classes_edit.textChanged.connect(self._on_world_classes_changed)
+        world_btns = QHBoxLayout()
+        self._save_classes_btn = QPushButton("Save Classes…")
+        self._save_classes_btn.clicked.connect(self._save_classes_dialog)
+        self._load_classes_btn = QPushButton("Load Classes…")
+        self._load_classes_btn.clicked.connect(self._load_classes_dialog)
+        world_btns.addWidget(self._save_classes_btn)
+        world_btns.addWidget(self._load_classes_btn)
+        world_btns.addStretch()
+        world_outer.addWidget(self._world_classes_edit)
+        world_outer.addLayout(world_btns)
+        self._world_frame.setVisible(False)   # shown when YOLO-World selected
+        vbox.addWidget(self._world_frame)
+
+        # ── Profile save + close ──
+        bottom = QHBoxLayout()
+        save_profile_btn = QPushButton("Save Profile…")
+        save_profile_btn.setToolTip(
+            "Save the current calibration + regions + blueprint combination\n"
+            "as a named .room.json profile for the toolbar dropdown."
+        )
+        save_profile_btn.clicked.connect(self._save_profile_dialog)
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(dlg.hide)
+        bottom.addWidget(save_profile_btn)
+        bottom.addStretch()
+        bottom.addWidget(close_btn)
+        vbox.addLayout(bottom)
+
+    def _show_room_setup(self):
+        self._room_setup_dlg.show()
+        self._room_setup_dlg.raise_()
+        self._room_setup_dlg.activateWindow()
+
+    # ------------------------------------------------------------------ workflow steps
+
+    def _update_steps(self):
+        """Refresh the workflow step indicator's done/pending states."""
+        done = [
+            self._video_path is not None,
+            self._homography_matrix is not None,
+            bool(self._path_points),
+            False,   # Analysis is a destination, not a completed state
+        ]
+        for i, (btn, is_done) in enumerate(zip(self._step_btns, done)):
+            base = btn.text().lstrip("✓ ").strip()
+            if is_done:
+                btn.setText(f"✓ {base}")
+                btn.setStyleSheet(
+                    "QPushButton { color:#66cc88; font-size:11px; border:none;"
+                    " background:transparent; text-align:left; }"
+                )
+            else:
+                btn.setText(base)
+                # first not-done step = suggested next action
+                is_next = all(done[:i])
+                color = "#ffcc66" if is_next else "#667"
+                weight = "bold" if is_next else "normal"
+                btn.setStyleSheet(
+                    f"QPushButton {{ color:{color}; font-size:11px; border:none;"
+                    f" background:transparent; text-align:left;"
+                    f" font-weight:{weight}; }}"
+                )
 
     # ------------------------------------------------------------------ video loaded
 
@@ -1506,6 +1673,7 @@ class MainWindow(QMainWindow):
 
         # Labels
         self._source_label.setText("")
+        self._update_steps()
 
     def _on_video_loaded(self, path: str):
         self._video_path = path
@@ -1521,16 +1689,26 @@ class MainWindow(QMainWindow):
         # the previous video's points.
         self._clear_all_results()
 
-        # Auto-load homography if it exists beside the video; otherwise clear
-        # any calibration left over from the previous video so a wrong matrix
-        # is never silently applied.  (Reuse across videos = pick from the
-        # calibration dropdown.)
+        # Calibration precedence:
+        #   1. An EXPLICIT choice (room profile, dropdown, Load Cal, or a
+        #      fresh calibration) stays active across video loads.
+        #   2. Otherwise auto-load the video's own .homography.json.
+        #   3. Otherwise no calibration — never silently inherit one.
         from backend.homography_config import default_homography_path
         hom_path = default_homography_path(path)
-        if hom_path.exists():
-            self._apply_calibration_file(str(hom_path), push_recent=False)
+        if self._cal_explicit and self._homography_matrix is not None:
+            if hom_path.exists():
+                self._status.showMessage(
+                    "Using the selected calibration — this video also has its "
+                    "own calibration file (pick it from Room Setup if preferred)."
+                )
+        elif hom_path.exists():
+            self._apply_calibration_file(
+                str(hom_path), push_recent=False, explicit=False
+            )
         else:
             self._clear_calibration()
+        self._update_steps()
 
         # Auto-load results JSON if it exists beside the video
         from backend.results_format import default_output_path
@@ -1662,6 +1840,8 @@ class MainWindow(QMainWindow):
         self._regions_combo.blockSignals(True)
         self._regions_combo.setCurrentIndex(0)   # "(no regions)"
         self._regions_combo.blockSignals(False)
+        self._current_regions_path = None
+        self._update_profile_dirty()
         self._schedule_refilter()
         self._status.showMessage("All regions cleared.")
 
@@ -1690,6 +1870,8 @@ class MainWindow(QMainWindow):
             self._settings().setValue("last_regions_path", path)
             self._push_recent_file("recent_region_files", path)
             self._refresh_regions_combo(select_path=path)
+            self._current_regions_path = path
+            self._update_profile_dirty()
             self._status.showMessage(
                 f"Regions saved → {Path(path).name}  ({len(self._regions)} regions)"
             )
@@ -1721,6 +1903,8 @@ class MainWindow(QMainWindow):
         if push_recent:
             self._push_recent_file("recent_region_files", path)
         self._refresh_regions_combo(select_path=path)
+        self._current_regions_path = path
+        self._update_profile_dirty()
         self._status.showMessage(
             f"Regions loaded: '{config_name}'  "
             f"({len(regions)} region{'s' if len(regions) != 1 else ''})"
@@ -1831,6 +2015,7 @@ class MainWindow(QMainWindow):
                 f"{prefix}: {Path(json_path).name}  —  refiltering…"
             )
             self._refilter()
+            self._update_steps()
 
         except Exception as exc:
             self._status.showMessage(f"Failed to load JSON: {exc}")
@@ -2072,6 +2257,7 @@ class MainWindow(QMainWindow):
         self._save_path_json()
         # Region Presence tab switches to path-based segments once path exists
         self._refilter()
+        self._update_steps()
 
     def _smoothed_points(self) -> list:
         """The canonical smoothed path used by every display and metric."""
@@ -2280,6 +2466,7 @@ class MainWindow(QMainWindow):
             matrix = save_homography(
                 path, pixel_pts, world_pts, list(room_size_cm),
             )
+            self._cal_explicit      = True
             self._homography_matrix = matrix
             self._room_size_cm      = tuple(room_size_cm)
             self._path_map.set_room_size(*room_size_cm)
@@ -2294,6 +2481,9 @@ class MainWindow(QMainWindow):
             )
             self._push_recent_file("recent_cal_files", str(path))
             self._refresh_cal_combo(select_path=str(path))
+            self._current_cal_path = str(path)
+            self._update_profile_dirty()
+            self._update_steps()
             self._reproject_path()
             self._status.showMessage(
                 f"Calibration saved → {path.name}"
@@ -2333,6 +2523,8 @@ class MainWindow(QMainWindow):
             )
             self._push_recent_file("recent_cal_files", path)
             self._refresh_cal_combo(select_path=path)
+            self._current_cal_path = path
+            self._update_profile_dirty()
             self._status.showMessage(
                 f"Calibration saved → {Path(path).name}"
             )
@@ -2350,14 +2542,20 @@ class MainWindow(QMainWindow):
         if path:
             self._apply_calibration_file(path)
 
-    def _apply_calibration_file(self, path: str, push_recent: bool = True):
-        """Load a homography file, apply it, and reproject any loaded path."""
+    def _apply_calibration_file(self, path: str, push_recent: bool = True,
+                                explicit: bool = True):
+        """
+        Load a homography file, apply it, and reproject any loaded path.
+        explicit=False marks a per-video auto-load, which future video loads
+        may replace; explicit choices persist across videos.
+        """
         try:
             from backend.homography_config import load_homography
             data = load_homography(path)
         except Exception as exc:
             self._status.showMessage(f"Failed to load calibration: {exc}")
             return
+        self._cal_explicit = explicit
 
         self._homography_matrix = data["matrix"]
         self._room_size_cm      = tuple(data["room_size_cm"])
@@ -2382,10 +2580,14 @@ class MainWindow(QMainWindow):
         if push_recent:
             self._push_recent_file("recent_cal_files", path)
         self._refresh_cal_combo(select_path=path)
+        self._current_cal_path = path
+        self._update_profile_dirty()
+        self._update_steps()
         self._reproject_path()
 
     def _clear_calibration(self):
         """Remove the active calibration (no homography for this video)."""
+        self._cal_explicit = False
         self._homography_matrix = None
         self._cal_pixel_pts     = []
         self._cal_world_pts     = []
@@ -2394,6 +2596,9 @@ class MainWindow(QMainWindow):
         self._path_cal_status_lbl.setText("No calibration")
         self._path_cal_status_lbl.setStyleSheet("font-size:10px; color:#8899aa;")
         self._refresh_cal_combo(select_path=None)
+        self._current_cal_path = None
+        self._update_profile_dirty()
+        self._update_steps()
 
     def _reproject_path(self):
         """
@@ -2450,6 +2655,121 @@ class MainWindow(QMainWindow):
         else:
             self._apply_calibration_file(path)
 
+    # ------------------------------------------------------------------ room profiles
+
+    def _refresh_profile_combo(self, select_path: str | None = None):
+        combo = self._profile_combo
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItem("(no profile)", None)
+        for p in self._recent_files("recent_profile_files"):
+            try:
+                from backend.room_profile import load_room_profile
+                name = load_room_profile(p)["name"]
+            except Exception:
+                name = Path(p).stem.replace(".room", "")
+            combo.addItem(name, p)
+        idx = combo.findData(select_path) if select_path else 0
+        combo.setCurrentIndex(idx if idx >= 0 else 0)
+        combo.blockSignals(False)
+
+    def _on_profile_combo_changed(self, index: int):
+        path = self._profile_combo.itemData(index)
+        if path is None:
+            # Detach only — components stay exactly as they are
+            self._current_profile_path = None
+            self._update_profile_dirty()
+        else:
+            self._apply_profile_file(path)
+
+    def _apply_profile_file(self, path: str):
+        """Apply every component the profile references (missing ones skipped)."""
+        try:
+            from backend.room_profile import load_room_profile
+            prof = load_room_profile(path)
+        except Exception as exc:
+            self._status.showMessage(f"Failed to load profile: {exc}")
+            return
+
+        self._applying_profile = True
+        try:
+            cal = prof.get("calibration_path")
+            if cal and Path(cal).exists():
+                self._apply_calibration_file(cal)
+            reg = prof.get("regions_path")
+            if reg and Path(reg).exists():
+                self._apply_regions_file(reg)
+            bp = prof.get("blueprint_path")
+            if bp and Path(bp).exists():
+                self._set_blueprint(bp)
+            elif not bp:
+                self._set_blueprint(None)
+        finally:
+            self._applying_profile = False
+
+        self._current_profile_path = path
+        self._push_recent_file("recent_profile_files", path)
+        self._refresh_profile_combo(select_path=path)
+        self._update_profile_dirty()
+        self._status.showMessage(f"Room profile applied: {prof['name']}")
+
+    def _save_profile_dialog(self):
+        """Save the current component combination as a named .room.json."""
+        default_dir = (str(Path(self._current_profile_path).parent)
+                       if self._current_profile_path
+                       else (str(Path(self._video_path).parent)
+                             if self._video_path else ""))
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Room Profile", default_dir,
+            "Room profile (*.room.json);;All files (*)"
+        )
+        if not path:
+            return
+        if not path.endswith(".json"):
+            path += ".room.json"
+        name, ok = QInputDialog.getText(
+            self, "Profile Name",
+            "Name for this room profile\n(e.g. 'Room A – Camera 1'):",
+            text=Path(path).stem.replace(".room", ""),
+        )
+        if not ok or not name.strip():
+            return
+        try:
+            from backend.room_profile import save_room_profile
+            save_room_profile(
+                path, name.strip(),
+                calibration_path = self._current_cal_path,
+                regions_path     = self._current_regions_path,
+                blueprint_path   = self._blueprint_path,
+            )
+            self._current_profile_path = path
+            self._push_recent_file("recent_profile_files", path)
+            self._refresh_profile_combo(select_path=path)
+            self._update_profile_dirty()
+            self._status.showMessage(f"Room profile saved → {Path(path).name}")
+        except Exception as exc:
+            self._status.showMessage(f"Failed to save profile: {exc}")
+
+    def _update_profile_dirty(self):
+        """Show the 'modified' marker when components differ from the profile."""
+        if self._applying_profile:
+            return
+        if not self._current_profile_path:
+            self._profile_dirty_lbl.setVisible(False)
+            return
+        try:
+            from backend.room_profile import load_room_profile
+            prof = load_room_profile(self._current_profile_path)
+        except Exception:
+            self._profile_dirty_lbl.setVisible(True)
+            return
+        dirty = (
+            (prof.get("calibration_path") or None) != self._current_cal_path
+            or (prof.get("regions_path") or None) != self._current_regions_path
+            or (prof.get("blueprint_path") or None) != self._blueprint_path
+        )
+        self._profile_dirty_lbl.setVisible(dirty)
+
     # ------------------------------------------------------------------ blueprint
 
     def _load_blueprint_dialog(self):
@@ -2470,6 +2790,7 @@ class MainWindow(QMainWindow):
         self._settings().setValue("blueprint_path", path or "")
         self._clear_blueprint_btn.setVisible(bool(path))
         self._blueprint_btn.setText("Blueprint ✓" if path else "Blueprint…")
+        self._update_profile_dirty()
         self._status.showMessage(
             f"Blueprint: {Path(path).name}" if path else "Blueprint removed."
         )
@@ -2482,10 +2803,11 @@ class MainWindow(QMainWindow):
 
     def _set_running(self, running: bool):
         has_video = self._video_path is not None
+        self._run_all_btn.setEnabled(not running and has_video)
         self._yolo_btn.setEnabled(not running and has_video)
         self._track_path_btn.setEnabled(not running and has_video)
         self._calibrate_btn.setEnabled(not running and has_video)
-        self._load_json_btn.setEnabled(not running)
+        self._load_json_act.setEnabled(not running)
         self._sample_spin.setEnabled(not running)
         self._all_classes_chk.setEnabled(not running)
         self._progress.setValue(0)
@@ -2542,17 +2864,6 @@ class MainWindow(QMainWindow):
         nav = QHBoxLayout()
         nav.setSpacing(6)
 
-        back_btn = QPushButton("← Back")
-        back_btn.setFixedWidth(80)
-        back_btn.setToolTip("Return to video + tables view")
-        back_btn.clicked.connect(self._hide_analysis_panel)
-        nav.addWidget(back_btn)
-
-        sep = QFrame()
-        sep.setFrameShape(QFrame.Shape.VLine)
-        sep.setStyleSheet("color: #3a3a5a;")
-        nav.addWidget(sep)
-
         # Sub-view toggle buttons
         self._analysis_view_btns: list[QPushButton] = []
         for i, (icon, name) in enumerate([
@@ -2586,6 +2897,18 @@ class MainWindow(QMainWindow):
         )
         self._analysis_xlsx_btn.clicked.connect(self._export_analysis_xlsx)
         nav.addWidget(self._analysis_xlsx_btn)
+
+        nav_sep = QFrame()
+        nav_sep.setFrameShape(QFrame.Shape.VLine)
+        nav_sep.setStyleSheet("color: #3a3a5a;")
+        nav.addWidget(nav_sep)
+
+        # Back sits top-right — same corner as the Analysis button that
+        # opened this panel, so entering and leaving use the same spot.
+        back_btn = QPushButton("✕  Back to video")
+        back_btn.setToolTip("Return to video + tables view")
+        back_btn.clicked.connect(self._hide_analysis_panel)
+        nav.addWidget(back_btn)
 
         panel_layout.addLayout(nav)
 
@@ -3359,6 +3682,11 @@ class MainWindow(QMainWindow):
         bp = s.value("blueprint_path", "")
         if bp and Path(bp).exists():
             self._set_blueprint(bp)
+        # Re-apply the last room profile (overrides the individual restores
+        # above with the profile's bundle; skipped when none was active)
+        last_profile = s.value("last_profile_path", "")
+        if last_profile and Path(last_profile).exists():
+            self._apply_profile_file(last_profile)
 
     def _save_settings(self):
         s = self._settings()
@@ -3374,6 +3702,7 @@ class MainWindow(QMainWindow):
         s.setValue("font_size",          self._font_size)
         s.setValue("theme_name",         self._theme_name)
         s.setValue("analysis_smooth",    self._analysis_smooth_window)
+        s.setValue("last_profile_path",  self._current_profile_path or "")
 
     def closeEvent(self, event):
         self._save_settings()

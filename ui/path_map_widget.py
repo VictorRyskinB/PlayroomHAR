@@ -30,7 +30,7 @@ from backend.path_analyzer import PathPoint
 
 
 # Padding around the room rectangle (widget pixels)
-_MARGIN = 30
+_MARGIN = 34
 
 
 class PathMapWidget(QWidget):
@@ -170,36 +170,31 @@ class PathMapWidget(QWidget):
         painter.setBrush(QBrush(QColor(20, 30, 50, 0 if overlay_present else 40)))
         painter.drawRect(int(rx), int(ry), int(rw), int(rh))
 
-        # Axis labels
-        painter.setPen(QPen(QColor("#667788")))
-        font = QFont("Arial", 8)
+        # Axis labels — width along the top edge (horizontal dimension),
+        # depth along the right edge (vertical dimension)
+        painter.setPen(QPen(QColor("#7788aa")))
+        font = QFont("Arial", 10)
         painter.setFont(font)
         # "Camera" label at bottom
         painter.drawText(
-            QRectF(rx, ry + rh + 4, rw, 16),
+            QRectF(rx, ry + rh + 4, rw, 20),
             Qt.AlignmentFlag.AlignCenter,
             "▲ Camera"
         )
-        # "Far wall" at top
+        # "Far wall" + room width at top
         painter.drawText(
-            QRectF(rx, ry - 18, rw, 16),
+            QRectF(rx, ry - 24, rw, 20),
             Qt.AlignmentFlag.AlignCenter,
-            "Far wall"
+            f"Far wall   ·   {self._room_w/100:.1f} m wide"
         )
-        # Width label
-        painter.drawText(
-            QRectF(0, ry + rh / 2 - 8, _MARGIN - 2, 16),
-            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
-            f"{self._room_w/100:.1f}m"
-        )
-        # Depth label (rotated)
+        # Depth label (rotated, right edge)
         painter.save()
-        painter.translate(w - 4, ry + rh / 2)
+        painter.translate(rx + rw + 16, ry + rh / 2)
         painter.rotate(-90)
         painter.drawText(
-            QRectF(-40, -8, 80, 16),
+            QRectF(-60, -10, 120, 20),
             Qt.AlignmentFlag.AlignCenter,
-            f"{self._room_d/100:.1f}m"
+            f"{self._room_d/100:.1f} m deep"
         )
         painter.restore()
 

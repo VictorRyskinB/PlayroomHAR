@@ -1708,6 +1708,16 @@ class MainWindow(QMainWindow):
             )
         else:
             self._clear_calibration()
+
+        # A profile can apply calibration at startup, before any video is
+        # open — the path maps then hold frame size 0 and can't project
+        # region overlays. Re-push the homography with the real dimensions
+        # (also covers switching between videos of different resolutions).
+        if self._homography_matrix is not None:
+            fw, fh = self._video.frame_width, self._video.frame_height
+            self._path_map.set_homography(self._homography_matrix, fw, fh)
+            self._analysis_path_map.set_homography(self._homography_matrix, fw, fh)
+
         self._update_steps()
 
         # Auto-load results JSON if it exists beside the video
